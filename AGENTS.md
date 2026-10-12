@@ -16,7 +16,15 @@ microphone and plays short meme audio clips into it.
 - Module ownership state: `$XDG_STATE_HOME/soundboard/modules.json` records
   the indices we loaded (see `src/graph.rs`); foreign modules are never
   touched.
-- GTK4 / gtk4-rs + libadwaita — the UI, next milestone (M3).
+- GTK4 / gtk4-rs 0.11 (features `v4_10`) + libadwaita 0.9 (feature `v1_4`) —
+  the GUI. Landed in M3a: `src/ui/worker.rs` (one worker thread owns all
+  blocking audio: PulseSession+Graph+PwCatPlayer+meter; UI talks via
+  std mpsc commands + async-channel replies, drained with
+  `glib::spawn_future_local` — `glib::MainContext::channel` is gone in
+  glib 0.22), `src/meter.rs` (peak meter off `virtmic.monitor` on its own
+  thread), `src/ui/window.rs` (doctor status rows, repair/test buttons, VU
+  `LevelBar`). Clip grid + toggles — next milestone (M3b). User-facing
+  strings are Russian; identifiers/comments English.
 - Errors: anyhow (app) + thiserror (typed error enums).
 
 ## Commands
