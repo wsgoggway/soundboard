@@ -1,12 +1,13 @@
-//! Main application window: status rows for the doctor checks, graph
-//! repair/test buttons, the virtual mic VU meter, the clip grid and the
-//! playback controls (volume, stop-all, behavior toggles).
+//! Main application window: a three-page `gtk::Stack` («Саундборд»,
+//! «Настройки», «Дебаг») switched from the header bar, a window-level
+//! failure banner, the virtual mic VU meter, the clip grid and the
+//! playback controls (volume, stop-all, behavior toggles, doctor checks).
 //!
 //! Threading rule (see [`super::worker`]): nothing blocking happens here —
 //! the window only sends [`WorkerCmd`]s to the audio worker and renders
-//! [`GuiMsg`]s arriving over glib channels. The clip grid scans
-//! `clips_dir` on the UI thread deliberately: `Clips::scan` is a single
-//! small readdir, no audio APIs involved.
+//! [`GuiMsg`]s arriving over glib channels. The clip grid scans `clips_dir`
+//! on the UI thread deliberately: `Clips::scan` is a single small readdir,
+//! no audio APIs involved.
 //!
 //! Config flow: toggles and the volume slider mutate the shared config
 //! under the lock (in-memory, instant for the worker), then either send
@@ -24,7 +25,8 @@ use async_channel::Receiver;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, FlowBox, Frame, Image, Label, LevelBar, Notebook, Orientation, Scale,
+    Box as GtkBox, Button, FlowBox, Frame, Image, Label, LevelBar, Orientation, Scale,
+    ScrolledWindow, Stack, StackSwitcher,
 };
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -33,6 +35,11 @@ use super::worker::{GuiMsg, SharedConfig, Worker, WorkerCmd, lock_config};
 use crate::clips::Clips;
 use crate::config::Config;
 use crate::graph::{CONF_HINT, DoctorReport, Report};
+
+/// `gtk::Stack` page names (also used for programmatic switches).
+const PAGE_BOARD: &str = "board";
+const PAGE_SETTINGS: &str = "settings";
+const PAGE_DEBUG: &str = "debug";
 
 /// Summary line for a doctor report.
 pub(crate) fn doctor_summary_line(report: &DoctorReport) -> &'static str {
@@ -94,6 +101,33 @@ pub(crate) fn clips_placeholder_text(dir: &Path) -> String {
 /// True when `name` is in the playing set (drives the button highlight).
 pub(crate) fn clip_is_playing(playing: &[String], name: &str) -> bool {
     playing.iter().any(|n| n == name)
+}
+
+/// Shows a short non-blocking notification at the top of the window.
+fn show_toast(overlay: &adw::ToastOverlay, text: &str) {
+    let toast = adw::Toast::new(text);
+    toast.set_timeout(6);
+    overlay.add_toast(toast);
+}
+
+/// Vertical page container with the common window margins.
+fn page_box() -> GtkBox {
+    let box_ = GtkBox::new(Orientation::Vertical, 12);
+    box_.set_margin_top(12);
+    box_.set_margin_bottom(12);
+    box_.set_margin_start(12);
+    box_.set_margin_end(12);
+    box_
+}
+
+/// A heading label (section title).
+fn heading(text: &str) -> Label {
+    let label = Label::builder()
+        .label(text)
+        .halign(gtk4::Align::Start)
+        .build();
+    label.add_css_class("heading");
+    label
 }
 
 /// The clip grid section: a `FlowBox` of clip buttons plus the empty-dir
@@ -227,18 +261,27 @@ pub(crate) fn build(
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
 
-    // Status section: summary line + a two-tab notebook. Tab «Статус» holds
-    // only the per-check rows (icon + name) so the main view stays compact;
-    // tab «Подробности» holds the raw per-check detail lines (module args,
-    // node ids, alsa names) verbatim. A plain `gtk::Notebook` is used
-    // deliberately: it styles fine inside libadwaita windows, unlike a
-    // custom expander it keeps both views reachable in one click.
+    // Window-level graph health banner: revealed ONLY when the last doctor
+    // status or reconcile has failures; «Открыть» jumps to the debug page.
+    // The header switcher + banner are the only chrome above the stack, so
+    // graph health stays visible from every page.
+    let banner = adw::Banner::builder()
+        .title("Граф: проблемы — см. вкладку Дебаг")
+        .button_label("Открыть")
+        .revealed(false)
+        .build();
+    toolbar.add_top_bar(&banner);
+
+    // Summary line of the latest doctor/reconcile/error report (debug page).
     let summary = Label::builder()
         .label("Автопроверка при запуске…")
         .halign(gtk4::Align::Start)
         .build();
     summary.add_css_class("heading");
-    let checks = GtkBox::new(Orientation::Vertical, 6);
+
+    // Doctor checks of the «Дебаг» page: merged rows (✓/✗ icon + name + the
+    // grey detail line inline — there is no separate details tab anymore).
+    let checks = GtkBox::new(Orientation::Vertical, 0);
     let checks_frame = Frame::new(None);
     checks_frame.set_child(Some(&checks));
     let placeholder_checks = Label::builder()
@@ -247,39 +290,27 @@ pub(crate) fn build(
         .sensitive(false)
         .build();
     checks.append(&placeholder_checks);
-    let details = GtkBox::new(Orientation::Vertical, 6);
-    let details_frame = Frame::new(None);
-    details_frame.set_child(Some(&details));
-    let placeholder_details = Label::builder()
-        .label("Ожидание подробностей проверки…")
-        .halign(gtk4::Align::Start)
-        .sensitive(false)
-        .build();
-    details.append(&placeholder_details);
-    let notebook = Notebook::new();
-    notebook.set_hexpand(true);
-    notebook.append_page(&checks_frame, Some(&Label::new(Some("Статус"))));
-    notebook.append_page(&details_frame, Some(&Label::new(Some("Подробности"))));
 
-    // Action buttons.
-    let buttons = GtkBox::new(Orientation::Horizontal, 8);
+    // Raw reconcile warnings («Починить граф» ran with warnings), if any.
+    let raw_warnings = Label::builder()
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    raw_warnings.add_css_class("dim-label");
+
+    // Action buttons of the «Дебаг» page.
+    let debug_buttons = GtkBox::new(Orientation::Horizontal, 8);
     let btn_doctor = Button::with_label("Проверить");
     let btn_repair = Button::with_label("Починить граф");
     btn_repair.add_css_class("suggested-action");
     let btn_test = Button::with_label("Тест");
-    let btn_stop_all = Button::with_label("Стоп всё");
-    btn_stop_all.add_css_class("destructive-action");
-    buttons.append(&btn_doctor);
-    buttons.append(&btn_repair);
-    buttons.append(&btn_test);
-    buttons.append(&btn_stop_all);
+    debug_buttons.append(&btn_doctor);
+    debug_buttons.append(&btn_repair);
+    debug_buttons.append(&btn_test);
 
-    // VU meter section.
-    let meter_caption = Label::builder()
-        .label("Виртуальный микрофон")
-        .halign(gtk4::Align::Start)
-        .build();
-    meter_caption.add_css_class("heading");
+    // VU meter section («Саундборд» page only).
+    let meter_caption = heading("Виртуальный микрофон");
     let level_bar = LevelBar::builder()
         .min_value(0.0)
         .max_value(1.0)
@@ -295,32 +326,28 @@ pub(crate) fn build(
         .build();
     conf_hint.add_css_class("dim-label");
 
-    // Clips section: caption + refresh button, then the grid.
+    // Clips section («Саундборд»): caption + refresh + stop-all + grid.
     let grid = Rc::new(ClipGrid::new());
-    let clips_caption = Label::builder()
-        .label("Клипы")
-        .halign(gtk4::Align::Start)
-        .valign(gtk4::Align::Center)
-        .build();
-    clips_caption.add_css_class("heading");
     let btn_refresh = Button::with_label("Обновить");
     btn_refresh.add_css_class("flat");
+    let btn_stop_all = Button::with_label("Стоп всё");
+    btn_stop_all.add_css_class("destructive-action");
+    let header_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    header_spacer.set_hexpand(true);
     let clips_header = GtkBox::new(Orientation::Horizontal, 8);
-    clips_header.append(&clips_caption);
+    clips_header.append(&heading("Клипы"));
     clips_header.append(&btn_refresh);
+    clips_header.append(&header_spacer);
+    clips_header.append(&btn_stop_all);
 
-    // Controls: volume slider.
-    let volume_caption = Label::builder()
-        .label("Громкость")
-        .halign(gtk4::Align::Start)
-        .build();
-    volume_caption.add_css_class("heading");
+    // Controls: volume slider («Саундборд»).
+    let volume_caption = heading("Громкость");
     let volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
     volume_scale.set_value(volume_factor_to_slider(current.volume));
     volume_scale.set_digits(0);
     volume_scale.set_hexpand(true);
 
-    // Controls: behavior toggles.
+    // Controls: behavior toggles («Настройки»).
     let sw_mic_mix = adw::SwitchRow::builder()
         .title("Микс с микрофоном")
         .subtitle("Пропускать настоящий микрофон в виртуальный")
@@ -341,28 +368,71 @@ pub(crate) fn build(
     toggles.add(&sw_monitoring);
     toggles.add(&sw_interrupt);
 
-    let content = GtkBox::new(Orientation::Vertical, 12);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
-    content.append(&summary);
-    content.append(&notebook);
-    content.append(&buttons);
-    content.append(&meter_caption);
-    content.append(&level_bar);
-    content.append(&conf_hint);
-    content.append(&clips_header);
-    content.append(&grid.container());
-    content.append(&volume_caption);
-    content.append(&volume_scale);
-    content.append(&toggles);
+    // Clips directory row («Настройки»): display + xdg-open button.
+    let dir_row = adw::ActionRow::builder()
+        .title("Папка клипов")
+        .subtitle(current.clips_dir.display().to_string())
+        .build();
+    let btn_open_dir = Button::with_label("Открыть папку");
+    btn_open_dir.add_css_class("flat");
+    dir_row.add_suffix(&btn_open_dir);
+    let dirs_group = adw::PreferencesGroup::new();
+    dirs_group.add(&dir_row);
+
+    // --- Page «Саундборд»: daily use -------------------------------------
+    let board = page_box();
+    board.append(&clips_header);
+    board.append(&grid.container());
+    board.append(&volume_caption);
+    board.append(&volume_scale);
+    board.append(&meter_caption);
+    board.append(&level_bar);
+    board.append(&conf_hint);
+
+    // --- Page «Настройки» -------------------------------------------------
+    let settings = page_box();
+    settings.append(&toggles);
+    settings.append(&dirs_group);
+
+    // --- Page «Дебаг»: doctor checks merged with details ------------------
+    let debug = page_box();
+    debug.append(&summary);
+    debug.append(&debug_buttons);
+    debug.append(&checks_frame);
+    debug.append(&raw_warnings);
+
+    // The stack itself; the switcher lives in the header bar title area.
+    let stack = Stack::new();
+    // Pages have very different heights — do not stretch them to the tallest.
+    stack.set_vhomogeneous(false);
+    stack.add_titled(&board, Some(PAGE_BOARD), "Саундборд");
+    stack.add_titled(&settings, Some(PAGE_SETTINGS), "Настройки");
+    stack.add_titled(&debug, Some(PAGE_DEBUG), "Дебаг");
+    let switcher = StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    header.set_title_widget(Some(&switcher));
+
+    // Pages may overflow the window: scroll vertically instead of clipping.
+    let scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .child(&stack)
+        .build();
+    scroll.set_vexpand(true);
 
     // Toasts surface worker errors without blocking the UI.
     let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&content));
+    toast_overlay.set_child(Some(&scroll));
     toolbar.set_content(Some(&toast_overlay));
     window.set_content(Some(&toolbar));
+
+    // Banner «Открыть» → the debug page.
+    {
+        let stack = stack.clone();
+        banner.connect_button_clicked(move |_banner| {
+            stack.set_visible_child_name(PAGE_DEBUG);
+        });
+    }
 
     // Buttons: send commands; immediate text feedback on the summary line.
     {
@@ -399,6 +469,27 @@ pub(crate) fn build(
         let worker = worker.clone();
         btn_refresh.connect_clicked(move |_btn| {
             grid.reload(&lock_config(&cfg), &worker);
+        });
+    }
+
+    // «Открыть папку»: xdg-open with an argv array (no shell); the child is
+    // reaped on a throwaway thread so the UI thread never blocks on wait().
+    {
+        let cfg = cfg.clone();
+        let toast_overlay = toast_overlay.clone();
+        btn_open_dir.connect_clicked(move |_btn| {
+            let dir = lock_config(&cfg).clips_dir.clone();
+            match std::process::Command::new("xdg-open").arg(&dir).spawn() {
+                Ok(child) => {
+                    std::thread::spawn(move || {
+                        let mut child = child;
+                        let _ = child.wait();
+                    });
+                }
+                Err(e) => {
+                    show_toast(&toast_overlay, &format!("Не удалось открыть папку: {e}"));
+                }
+            }
         });
     }
 
@@ -446,13 +537,14 @@ pub(crate) fn build(
     // Both Status and GraphUp refresh the clip grid: new files become
     // buttons without a manual rescan, and the very first doctor report
     // (which arrives even when the startup reconcile failed) builds it.
-    let (summary_rx, checks_rx, details_rx, window_rx) = (
+    let (summary_rx, checks_rx, raw_rx, window_rx) = (
         summary.clone(),
         checks.clone(),
-        details.clone(),
+        raw_warnings.clone(),
         window.clone(),
     );
     let grid_rx = grid.clone();
+    let banner_rx = banner.clone();
     let worker_rx = worker.clone();
     let cfg_rx = cfg.clone();
     let toast_rx = toast_overlay.clone();
@@ -469,7 +561,7 @@ pub(crate) fn build(
                         Some(report.all_passed()),
                     );
                     rebuild_check_rows(&checks_rx, &report);
-                    rebuild_detail_rows(&details_rx, &report);
+                    banner_rx.set_revealed(!report.all_passed());
                     grid_rx.reload(&lock_config(&cfg_rx), &worker_rx);
                 }
                 GuiMsg::GraphUp(report) => {
@@ -478,6 +570,11 @@ pub(crate) fn build(
                         reconcile_summary_line(&report),
                         Some(report.warnings.is_empty()),
                     );
+                    raw_rx.set_visible(!report.warnings.is_empty());
+                    if !report.warnings.is_empty() {
+                        raw_rx.set_text(&report.warnings.join("\n"));
+                    }
+                    banner_rx.set_revealed(!report.warnings.is_empty());
                     grid_rx.reload(&lock_config(&cfg_rx), &worker_rx);
                 }
                 GuiMsg::PlayingSet(names) => {
@@ -485,9 +582,7 @@ pub(crate) fn build(
                 }
                 GuiMsg::Error(text) => {
                     set_summary(&summary_rx, &format!("Ошибка: {text}"), Some(false));
-                    let toast = adw::Toast::new(&format!("Ошибка: {text}"));
-                    toast.set_timeout(6);
-                    toast_rx.add_toast(toast);
+                    show_toast(&toast_rx, &format!("Ошибка: {text}"));
                 }
                 GuiMsg::ShutdownComplete => window_rx.destroy(),
             }
@@ -573,8 +668,10 @@ fn set_summary(label: &Label, text: &str, ok: Option<bool>) {
     }
 }
 
-/// Rebuilds the per-check status rows of the «Статус» tab: icon (green/red)
-/// + check name only — the raw details live on the «Подробности» tab.
+/// Rebuilds the doctor check rows of the «Дебаг» page: one row per check —
+/// the ✓/✗ icon, the check name and its raw detail line (module args, node
+/// ids, alsa names) inline. This page IS the details view: nothing is
+/// hidden behind a tab switch anymore.
 fn rebuild_check_rows(checks: &GtkBox, report: &DoctorReport) {
     while let Some(child) = checks.first_child() {
         checks.remove(&child);
@@ -584,30 +681,6 @@ fn rebuild_check_rows(checks: &GtkBox, report: &DoctorReport) {
         icon.set_pixel_size(16);
         icon.add_css_class(check_css_class(check.passed));
         icon.set_valign(gtk4::Align::Start);
-        let name = Label::builder()
-            .label(&check.name)
-            .halign(gtk4::Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
-            .build();
-        let row = GtkBox::new(Orientation::Horizontal, 6);
-        row.set_margin_start(8);
-        row.set_margin_end(8);
-        row.set_margin_top(4);
-        row.set_margin_bottom(4);
-        row.append(&icon);
-        row.append(&name);
-        checks.append(&row);
-    }
-}
-
-/// Rebuilds the «Подробности» tab: one wrapped row per check — the check
-/// name plus its raw detail line verbatim (module args, node ids, alsa
-/// names), so nothing is hidden behind an ellipsis here.
-fn rebuild_detail_rows(details: &GtkBox, report: &DoctorReport) {
-    while let Some(child) = details.first_child() {
-        details.remove(&child);
-    }
-    for check in &report.checks {
         let name = Label::builder()
             .label(&check.name)
             .halign(gtk4::Align::Start)
@@ -628,8 +701,9 @@ fn rebuild_detail_rows(details: &GtkBox, report: &DoctorReport) {
         row.set_margin_end(8);
         row.set_margin_top(4);
         row.set_margin_bottom(4);
+        row.append(&icon);
         row.append(&texts);
-        details.append(&row);
+        checks.append(&row);
     }
 }
 
