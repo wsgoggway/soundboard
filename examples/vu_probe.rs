@@ -1,8 +1,9 @@
 //! vu_probe — live peak-level probe for a PipeWire/PulseAudio source.
 //!
 //! Debugging tool for the soundboard virtual mic: connects to `source`
-//! (default `virtmic.monitor`, the monitor of the soundboard virtual mic)
-//! and prints the capture peak about 10 times per second, e.g.
+//! (default `virtmic`, the native Audio/Source/Virtual node — what Zoom
+//! selects as "Virtual_Mic") and prints the capture peak about 10 times per
+//! second, e.g.
 //!
 //! ```text
 //! 0.413  ################......................
@@ -24,9 +25,9 @@ use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::{FlagSet, PeekResult, State as StreamState, Stream};
 
-/// Default source: the soundboard virtual mic monitor (contract
-/// `docs/pipewire-recipe.md`).
-const DEFAULT_SOURCE: &str = "virtmic.monitor";
+/// Default source: the virtual mic itself (the native Audio/Source/Virtual
+/// node; contract `docs/pipewire-recipe.md`).
+const DEFAULT_SOURCE: &str = "virtmic";
 /// Capture spec requested from the server (same as the GUI meter).
 const CAPTURE_SPEC: Spec = Spec {
     format: Format::F32le,

@@ -61,7 +61,7 @@ use anyhow::{Context as _, Result};
 
 use crate::clips::Clips;
 use crate::config::Config;
-use crate::graph::{DoctorReport, Graph, PulseSession, Report};
+use crate::graph::{DoctorReport, Graph, PulseSession, PwTooling, Report};
 use crate::meter::MeterHandle;
 use crate::player::{Player as _, PwCatPlayer};
 use crate::scheduler::{Decision, Handle, PlayRequest, Request, Scheduler, StopRequest};
@@ -536,18 +536,19 @@ fn meter_stop(meter: &mut Option<MeterHandle>) {
     }
 }
 
-/// Connects to the pulse server and builds the graph facade (same recipe as
-/// the CLI entry point).
-fn open_graph() -> Result<Graph<PulseSession>> {
+/// Connects to the pulse server, builds the graph facade (pulse + native
+/// pw-cli/pw-link tooling; same recipe as the CLI entry point).
+fn open_graph() -> Result<Graph<PulseSession, PwTooling>> {
     let session = PulseSession::connect("soundboard")?;
     let state_path = crate::graph::default_state_path()?;
-    Ok(Graph::new(session, state_path))
+    Ok(Graph::new(session, PwTooling::system(), state_path))
 }
 
-/// Starts the meter against the virtual mic monitor; failures are surfaced
+/// Starts the meter against the virtual mic source (the native
+/// Audio/Source/Virtual node, pulse alias `virtmic`); failures are surfaced
 /// once and the meter stays stopped (returns `None`).
 fn start_meter(ui: &impl Fn(GuiMsg), meter_tx: &async_channel::Sender<f32>) -> Option<MeterHandle> {
-    match MeterHandle::start(crate::graph::SOURCE_VIRTMIC_MONITOR, meter_tx.clone()) {
+    match MeterHandle::start(crate::graph::SOURCE_VIRTMIC, meter_tx.clone()) {
         Ok(handle) => Some(handle),
         Err(e) => {
             ui(GuiMsg::Error(format!("{e:#}")));

@@ -1,14 +1,16 @@
-//! Live peak meter for the virtual microphone monitor source.
+//! Live peak meter for the virtual microphone source.
 //!
-//! Captures f32 samples from [`crate::graph::SOURCE_VIRTMIC_MONITOR`] on a
-//! dedicated thread with a private libpulse session (the graph session stays
-//! owned by the UI worker; all libpulse calls are blocking, so this thread
-//! must never be the GTK main thread). Peak amplitude is computed per ~33 ms
-//! window and pushed into an `async_channel::Sender<f32>` for the UI
-//! `LevelBar`, throttled: a new value is only sent when it differs from the
-//! previous one by more than [`SEND_THRESHOLD`]. (async-channel is the
-//! current gtk4-rs book pattern for worker→UI communication; the older
-//! `glib::MainContext::channel` was removed in glib 0.22.)
+//! Captures f32 samples from [`crate::graph::SOURCE_VIRTMIC`] — the native
+//! `Audio/Source/Virtual` node (pulse alias `virtmic`, NOT a `*.monitor`;
+//! see ADR 0004) — on a dedicated thread with a private libpulse session
+//! (the graph session stays owned by the UI worker; all libpulse calls are
+//! blocking, so this thread must never be the GTK main thread). Peak
+//! amplitude is computed per ~33 ms window and pushed into an
+//! `async_channel::Sender<f32>` for the UI `LevelBar`, throttled: a new
+//! value is only sent when it differs from the previous one by more than
+//! [`SEND_THRESHOLD`]. (async-channel is the current gtk4-rs book pattern
+//! for worker→UI communication; the older `glib::MainContext::channel` was
+//! removed in glib 0.22.)
 //!
 //! Failure model: if the source cannot be connected (absent graph, pulse
 //! server down) the setup error is returned synchronously by
@@ -40,7 +42,7 @@ const SEND_THRESHOLD: f32 = 0.01;
 const PUMP_STEP: Duration = Duration::from_millis(5);
 /// Upper bound for the stream to become ready.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Capture spec requested from the server (it converts from the monitor's
+/// Capture spec requested from the server (it converts from the source's
 /// `float32le 2ch 48000Hz`, contract `docs/pipewire-recipe.md`).
 const CAPTURE_SPEC: Spec = Spec {
     format: Format::F32le,

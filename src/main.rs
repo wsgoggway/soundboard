@@ -31,7 +31,7 @@ use clap::Parser;
 use cli::Commands;
 use clips::Clips;
 use config::Config;
-use graph::{Graph, PulseSession};
+use graph::{Graph, PulseSession, PwTooling};
 use player::{Player as _, PwCatPlayer};
 
 fn main() -> ExitCode {
@@ -44,12 +44,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Connects to the pulse server and builds the graph facade with the default
-/// module state path.
-fn open_graph() -> Result<Graph<PulseSession>> {
+/// Connects to the pulse server and builds the graph facade (pulse + native
+/// pw-cli/pw-link tooling) with the default state path.
+fn open_graph() -> Result<Graph<PulseSession, PwTooling>> {
     let session = PulseSession::connect("soundboard")?;
     let state_path = graph::default_state_path()?;
-    Ok(Graph::new(session, state_path))
+    Ok(Graph::new(session, PwTooling::system(), state_path))
 }
 
 /// Reconciles the audio graph so playback has somewhere to go; on failure
