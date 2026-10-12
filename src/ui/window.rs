@@ -474,7 +474,7 @@ pub(crate) fn build(
 
     // Graceful shutdown: keep the window until the worker confirms cleanup
     // (config saved, meter stopped, playbacks stopped); the graph stays up
-    // for Zoom.
+    // for Zoom. SIGINT/SIGTERM route through this same close-request path.
     {
         let worker = worker.clone();
         window.connect_close_request(move |_window| {
@@ -483,12 +483,53 @@ pub(crate) fn build(
         });
     }
 
+    install_signal_close_poll(&window);
+
     // Build the grid right away instead of waiting for the first worker
     // report (scan is a cheap readdir).
     grid.reload(&current, worker);
 
     window.present();
     window
+}
+
+/// Signal shutdown flag: set by the libc handlers, polled on the main loop.
+/// glib 0.22 has no unix-signal sources (`unix_signal_add_local` was
+/// removed), so a handler may only touch an async-signal-safe atomic; a
+/// small main-loop timeout routes the flag into the normal close-request
+/// path. A repeated signal before the loop polls it is harmless; after the
+/// poll source stops, the process is already exiting.
+static SIGNAL_CLOSE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// libc signal handler: async-signal-safe (a single atomic store).
+extern "C" fn on_close_signal(_signum: libc::c_int) {
+    SIGNAL_CLOSE_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Registers SIGINT/SIGTERM handlers and a main-loop poll that routes them
+/// through the same shutdown path as clicking the window's [X]
+/// (`window.close()` → close-request → `WorkerCmd::Shutdown` → worker stops
+/// meter + playbacks → `ShutdownComplete` → window destroyed, exit 0; the
+/// graph stays up). Raw libc FFI follows the recorded unsafe ADR (same
+/// precedent as `player.rs`'s `kill`).
+fn install_signal_close_poll(window: &adw::ApplicationWindow) {
+    for signum in [libc::SIGINT, libc::SIGTERM] {
+        // Safety: `libc::signal` only registers the handler; the handler
+        // itself performs a single async-signal-safe atomic store.
+        unsafe {
+            libc::signal(signum, on_close_signal as *const () as libc::sighandler_t);
+        }
+    }
+    let window = window.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+        if SIGNAL_CLOSE_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            window.close();
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 /// Replaces the summary text and (optionally) its ok/error tint.
