@@ -41,6 +41,10 @@ microphone and plays short meme audio clips into it.
 - `just test` — `cargo test`
 - `just lint` — `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings`
 - `just run` — `cargo run`
+- `cargo run --example vu_probe -- [source]` — live peak probe of a pulse
+  source (default `virtmic.monitor`), ~10 lines/sec, Ctrl+C to stop; the
+  debugging tool for the virtual mic meter (self-contained: the crate has
+  no lib target, so it mirrors `src/meter.rs` instead of importing it)
 
 Toolchains come via mise only; never install system packages.
 
@@ -55,6 +59,7 @@ Toolchains come via mise only; never install system packages.
 - `src/scheduler.rs` — per-clip interrupt decisions
 - `src/meter.rs` — audio level metering (M3)
 - `src/ui/` — GTK4/libadwaita UI (M3)
+- `examples/vu_probe.rs` — CLI peak probe for debugging the meter (M3b)
 
 ## Docs
 
