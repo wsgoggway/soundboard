@@ -73,6 +73,24 @@ must select `virtmic.monitor`. All four nodes negotiate
 - RMS over a 1 s in-signal window: **11584 = 0.3535 FS** (= 0.5/sqrt(2),
   the signature of a pure 0.5-FS sine)
 
+## pw-cat decode support (verified 2026-10-12)
+
+Live check: 1 s 440 Hz sine per format, played with
+`pw-cat --playback --target soundboard --volume 1.0`, captured from
+`virtmic.monitor` (`parec --format=s16le --rate=48000 --channels=2`), peak of
+the raw s16 stream:
+
+| format | generator                       | peak (FS) | verdict |
+|--------|---------------------------------|-----------|---------|
+| wav    | python3 `wave`, 0.500 FS sine   | **0.500** | decodes (exact) |
+| mp3    | ffmpeg lavfi sine, 0.125 FS     | **0.119** | decodes (codec ripple) |
+| ogg    | ffmpeg lavfi sine, 0.125 FS     | **0.128** | decodes (codec ripple) |
+| flac   | ffmpeg lavfi sine, 0.125 FS     | **0.125** | decodes (exact) |
+
+`pw-cat` exited 0 on every format; no format in the M2 extension list is
+known-unplayable. The `--volume` flag is documented by `pw-cat --help`
+("Stream volume 0-1.0") and is passed by the player explicitly.
+
 ## Extra loopback checks (verified loading cleanly)
 
 ```bash
