@@ -14,7 +14,7 @@ contract onto the code. Keep it in sync with the code in the same commit.
 | CLI | `src/main.rs`, `src/cli.rs` | Subcommands `up`/`down`/`doctor`/`list`/`play`/`stop`/`hotkeys`; no subcommand launches the GUI. Loads config, prints reports. |
 | GUI | `src/ui/window.rs`, `src/ui/mod.rs` | libadwaita window: doctor status rows, repair/test/stop buttons, VU `LevelBar`, clip grid (FlowBox), volume slider, mic-mix/monitoring/interrupt toggles, error toasts. Sends commands only — nothing blocking on the UI thread. |
 | Audio worker | `src/ui/worker.rs` | One thread owning all blocking audio: pulse session, graph, player, scheduler, meter. Auto-reconciles + runs doctor at startup; restarts the meter on every successful reconcile; persists config; stops playbacks on shutdown while deliberately leaving the graph up. |
-| Graph manager | `src/graph.rs` | Idempotent desired-state reconcile over TWO layers: pulse null-sink + optional monitoring loopback (libpulse), and the native `Audio/Source/Virtual` node `virtmic` + `pw-link` feeds (`pw-cli`/`pw-link` subprocesses); module/node ownership state file; `doctor` checks; foreign modules and links are never touched. |
+| Graph manager | `src/graph.rs` | Idempotent desired-state reconcile over TWO layers: pulse null-sinks + loopbacks (libpulse: memes sink, mic-mix mixer sink `sbmicmix` + mic loopback, monitoring loopback), and the native `Audio/Source/Virtual` node `virtmic` + `pw-link` feeds (`pw-cli`/`pw-link` subprocesses); module/node ownership state file; `doctor` checks; foreign modules and links are never touched. |
 | Player | `src/player.rs` | One `pw-cat --playback --target soundboard` subprocess per clip (own process group, SIGTERM→SIGKILL stop); cross-process stop by scanning `/proc/*/cmdline`. |
 | Scheduler | `src/scheduler.rs` | Pure playback policy: per-clip interrupt vs. overlap, stop-one/stop-all decisions over opaque handles. |
 | Meter | `src/meter.rs` | Peak meter capturing `virtmic` (the native virtual source) on its own thread (~30 Hz, throttled) into an async channel for the UI. |
@@ -28,20 +28,22 @@ contract onto the code. Keep it in sync with the code in the same commit.
 The graph from [`docs/pipewire-recipe.md`](pipewire-recipe.md): the clips
 sink `soundboard` (pulse), the NATIVE virtual source node `virtmic`
 (`Audio/Source/Virtual`, description "Virtual_Mic") fed by `pw-link` port
-pairs, and two optional passthroughs: real-mic links (`mic_mix`) into the
-same virtmic inputs (the adapter soft-mixer sums multiple feeds) and the
-pulse monitoring loopback to the real speakers. The conferencing app
-captures the pulse source `virtmic` — a real source, NOT a monitor (such
-apps filter monitor sources; that is why the native node exists,
-ADR 0004). The GUI meter captures the same source.
+pairs, and two optional passthroughs: the mic-mix chain (`mic_mix`, ADR
+0005 — real mic → pulse module-loopback → mixer sink `sbmicmix` → native
+monitor links into the same virtmic inputs) and the pulse monitoring
+loopback to the real speakers. The conferencing app captures the pulse
+source `virtmic` — a real source, NOT a monitor (such apps filter monitor
+sources; that is why the native node exists, ADR 0004). The GUI meter
+captures the same source.
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 flowchart LR
     CLIPS["Clips<br/>~/Music/soundboard-clips"]
     SB["sink soundboard<br/>Meme_Soundboard (pulse)"]
+    MIC["real mic<br/>resolved source (never virtmic)"]
+    SBM["sink sbmicmix<br/>SB_MicMix (pulse)"]
     VM["node virtmic<br/>Audio/Source/Virtual (native)"]
-    MIC["real mic<br/>default source"]
     RS["real sink<br/>default sink"]
     LB["monitoring loopback<br/>pulse"]
     CONF["conferencing app<br/>microphone = Virtual_Mic"]
@@ -49,7 +51,8 @@ flowchart LR
 
     CLIPS -->|"pw-cat"| SB
     SB -->|"pw-link monitor_FL/FR"| VM
-    MIC -.->|"pw-link capture_FL/FR (mic_mix)"| VM
+    MIC -.->|"module-loopback (mic_mix)"| SBM
+    SBM -.->|"pw-link monitor_FL/FR"| VM
     SB -.->|"module-loopback (monitoring)"| LB
     LB --> RS
     VM -->|"pulse source virtmic"| CONF
@@ -57,9 +60,11 @@ flowchart LR
 ```
 
 Solid edges are the always-on path; dotted edges exist only while the
-`mic_mix` / `monitoring` config flags are on (the mic links and the
-loopback are re-targeted to the current default source/sink on every
-reconcile). Links into `virtmic` are mixed by the adapter's soft-mixer.
+`mic_mix` / `monitoring` config flags are on. The mic-mix loopback is
+re-targeted when the resolved real mic changes (default source if usable,
+else the first `alsa_input.*`; never `virtmic` or a monitor — ADR 0005),
+the monitoring loopback follows the default sink. Links into `virtmic` are
+mixed by the adapter's soft-mixer.
 
 Deliberately NOT used (live-tested broken variants, see the recipe): the
 pulse-level `module-null-sink media.class=Audio/Source/Virtual` (no pulse
@@ -112,4 +117,5 @@ flowchart LR
 
 Architecture decisions live in [`docs/adr/`](adr/) (append-only):
 0001 pw-cat player process model · 0002 KDE hotkeys via desktop files ·
-0003 GUI toolkit GTK4 · 0004 virtmic as a native Audio/Source/Virtual node.
+0003 GUI toolkit GTK4 · 0004 virtmic as a native Audio/Source/Virtual node ·
+0005 mic-mix via the sbmicmix mixer sink.

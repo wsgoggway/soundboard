@@ -12,9 +12,11 @@ Jitsi, Discord, …).
   `mise.toml`).
 - CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`;
   graph reconcile over two layers (pulse via `libpulse-binding`: null-sink
-  `soundboard` + optional monitoring loopback; native via `pw-cli`/`pw-link`
-  subprocesses: the `Audio/Source/Virtual` node `virtmic` + pw-link feeds,
-  ADR 0004); playback via a `pw-cat` subprocess (`PwCatPlayer`,
+  `soundboard` + the mic-mix mixer sink `sbmicmix` with its real-mic
+  loopback (ADR 0005) + optional monitoring loopback; native via
+  `pw-cli`/`pw-link` subprocesses: the `Audio/Source/Virtual` node `virtmic`
+  + pw-link feeds, ADR 0004); playback via a `pw-cat` subprocess
+  (`PwCatPlayer`,
   cross-process stop through `/proc`); clips registry + per-clip-interrupt
   scheduler.
 - KDE hotkeys (M4): `src/hotkeys.rs` — `soundboard hotkeys` prints a Russian

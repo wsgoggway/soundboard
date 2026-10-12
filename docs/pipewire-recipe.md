@@ -6,11 +6,11 @@ verified 2026-10-12; the native `Audio/Source/Virtual` recipe verified the
 same day by the research slice and by M7 live tests. This file is the
 CONTRACT for `graph.rs` — code against these exact names and commands.
 
-## Working recipe (verified, current design — ADR 0004)
+## Working recipe (verified, current design — ADR 0004, ADR 0005)
 
 The graph spans two layers. The virtual mic is a NATIVE PipeWire node; the
-pulse layer only provides the playback sink and the optional monitoring
-loopback.
+pulse layer provides the playback sink, the mic-mix mixer chain (when
+`mic_mix` is on) and the optional monitoring loopback.
 
 ```bash
 # 1. Soundboard sink (clips are played into this) — pulse layer
@@ -28,9 +28,16 @@ pw-cli create-node adapter '{ factory.name=support.null-audio-sink \
 pw-link soundboard:monitor_FL virtmic:input_FL
 pw-link soundboard:monitor_FR virtmic:input_FR
 
-# 4. Pass the real mic through — only when mic_mix is on
-pw-link alsa_input.pci-....Mic__source:capture_FL virtmic:input_FL
-pw-link alsa_input.pci-....Mic__source:capture_FR virtmic:input_FR
+# 4. Mix the real mic in — only when mic_mix is on. THREE pieces (ADR 0005):
+#    a dedicated mixer sink + a rate-adapting loopback from the real mic
+#    (keeps it awake, no ENOENT, proper resampling) + native links from the
+#    mixer monitor. <real_mic> NEVER resolves to virtmic or *.monitor —
+#    prefer the pulse default source, fall back to the first `alsa_input.*`.
+pactl load-module module-null-sink sink_name=sbmicmix \
+  media.class=Audio/Sink sink_properties=device.description=SB_MicMix
+pactl load-module module-loopback source=<real_mic> sink=sbmicmix
+pw-link sbmicmix:monitor_FL virtmic:input_FL
+pw-link sbmicmix:monitor_FR virtmic:input_FR
 
 # 5. Local monitoring — only when monitoring is on (pulse layer)
 pactl load-module module-loopback source=soundboard.monitor \
@@ -76,6 +83,8 @@ lists as "Virtual_Mic" (ADR 0004 has the full decision record).
 |--------------|----------------------|------------------------------------------------------------|
 | sink         | `soundboard`         | description "Meme_Soundboard"; clips play here             |
 | source       | `soundboard.monitor` | monitor of the soundboard sink; feeds the links/loopbacks  |
+| sink         | `sbmicmix`           | description "SB_MicMix"; mic-mix mixer (mic_mix only, ADR 0005) |
+| source       | `sbmicmix.monitor`   | monitor of the mixer sink; feeds the mic-mix links         |
 | source       | `virtmic`            | **NOT a monitor** — the native node itself; THIS is what the conferencing app selects as "Virtual_Mic" |
 
 The native node has NO pulse owner module — it cannot be unloaded via
@@ -88,13 +97,50 @@ modules).
 | Node                    | Ports (DSP `32 bit float mono audio`) |
 |-------------------------|----------------------------------------|
 | `soundboard`            | outputs `monitor_FL`, `monitor_FR`     |
+| `sbmicmix`              | inputs `playback_FL/FR`; outputs `monitor_FL`, `monitor_FR` |
 | `virtmic`               | inputs `input_FL`, `input_FR`          |
 | real mic (`alsa_input.…`) | outputs `capture_FL`, `capture_FR`   |
 
 Multiple feeds into the same `virtmic` input port are MIXED by the
 adapter's soft-mixer (research-verified: two 440 Hz + 1 kHz tones summed,
-both recovered at 0.5 FS) — that is why mic pass-through does not need a
-separate mixing node.
+both recovered at 0.5 FS) — that is why the memes and mic-mix feeds can
+share the inputs.
+
+## Mic mix path (ADR 0005)
+
+The real mic reaches the virtual mic through a dedicated mixer chain, NOT
+through direct `<mic>:capture_* -> virtmic:input_*` links. Two live-verified
+traps kill the direct-link design:
+
+1. **ENOENT on a suspended mic.** A SUSPENDED ALSA source has no PipeWire
+   ports until a capture stream runs on it, so `pw-link
+   <mic>:capture_FL virtmic:input_FL` fails with ENOENT — the link is
+   silently missing until something happens to wake the mic. The pulse
+   `module-loopback source=<real_mic> sink=sbmicmix` keeps the mic awake
+   (a running capture stream) and does proper rate adaptation.
+2. **The default source can be `virtmic` itself.** `pactl
+   get-default-source` returned `virtmic` on the user's session (they set
+   Virtual_Mic as the system default so Zoom's "Same as System" picks it).
+   Resolving "the real mic" as the default source then produced
+   `virtmic:capture_* -> virtmic:input_*` SELF-LINKS: the adapter mixes its
+   own monitor back into its inputs, the node becomes an integrator and the
+   level ramps to float saturation — the user heard a loud buzz instead of
+   their voice (measured 2026-10-12: peak 2.77 FS, RMS 1.20 flat, DC 0.146
+   on room noise).
+
+Resolution rules (pure function in `graph.rs`, unit-tested): candidates =
+all pulse sources excluding `virtmic`, `*.monitor` (by flag or by name);
+prefer the current default source when it survives the exclusions, else the
+first `alsa_input.*` source; none → the whole mic path is skipped with a
+warning and `doctor` FAILs with an actionable Russian message.
+
+Live numbers after switching the user's graph from the broken direct links
+to the mixer chain (2026-10-12, 3 s room-noise capture of `virtmic`):
+peak 2.77 → **0.21** FS, RMS 1.20 → **0.044** FS — clean, no clipping.
+
+Regression guard: any `virtmic:* -> virtmic:*` link is never desired; the
+reconciler destroys pre-existing self-links on `up`, and `doctor` carries a
+dedicated «самопетля» check.
 
 ## Discovery / teardown
 
@@ -108,11 +154,11 @@ pw-link -l
 # Teardown: our links first (same pairs as creation), then the node
 pw-link -d soundboard:monitor_FL virtmic:input_FL
 pw-link -d soundboard:monitor_FR virtmic:input_FR
-pw-link -d alsa_input...:capture_FL virtmic:input_FL   # when present
-pw-link -d alsa_input...:capture_FR virtmic:input_FR   # when present
+pw-link -d sbmicmix:monitor_FL virtmic:input_FL         # when mic_mix was on
+pw-link -d sbmicmix:monitor_FR virtmic:input_FR         # when mic_mix was on
 pw-cli destroy <virtmic-node-id>
 
-# pulse layer teardown as before
+# pulse layer teardown as before (soundboard + sbmicmix modules + loopbacks)
 pactl unload-module <index>
 ```
 
@@ -143,6 +189,22 @@ nodes.
    the target and records from the default microphone (verified: capture
    stream bound to `Source: 55`, the real mic, while asking for virtmic).
    For tests use `parec -d virtmic`, which binds exactly.
+4. **`virtmic:capture_* -> virtmic:input_*` self-links (measured
+   2026-10-12, the mic_mix buzz bug):** the adapter MIXES its own monitor
+   back into its inputs, so the node becomes an integrator
+   (`y = input + previous_output`) whose level ramps to float saturation.
+   Measured on a real clip through the soundboard sink: monitor peak
+   0.749 FS (clean) while virtmic peaked at 3.79 FS with DC drift
+   (+0.10) — loud digital garbage on everything the virtual mic carries.
+   Triggered when `real_mic` resolved to `virtmic` itself (the pulse
+   default source WAS virtmic) and the old binary dutifully created the
+   two self-links. Fix (ADR 0005): the mic goes through the `sbmicmix`
+   mixer chain, `real_mic` excludes `virtmic`/monitors, the reconciler
+   destroys any pre-existing self-links and `doctor` carries a
+   «самопетля» check.
+   Note: `pw-cli`/user clients cannot destroy these lingering
+   (`object.linger=true`, `link.feedback=true`) kernel links directly —
+   the app's own teardown (`pw-link -d` by name pair) can.
 
 ## End-to-end signal proof (verified numbers)
 
@@ -180,9 +242,9 @@ known-unplayable. The `--volume` flag is documented by `pw-cat --help`
 `soundboard down` is complete when ALL of the following are empty:
 
 ```bash
-pactl list short modules | grep -E 'soundboard|virtmic'
-pactl list short sinks   | grep -E 'soundboard'
-pactl list short sources | grep -E 'soundboard|virtmic'
+pactl list short modules | grep -E 'soundboard|sbmicmix|virtmic'
+pactl list short sinks   | grep -E 'soundboard|sbmicmix'
+pactl list short sources | grep -E 'soundboard|sbmicmix|virtmic'
 pw-cli ls Node | grep 'node.name = "virtmic"'
 pw-link -l | grep -B1 virtmic
 ```

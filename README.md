@@ -34,8 +34,9 @@ played by a `pw-cat` subprocess into the `soundboard` null-sink, `pw-link`
 routes its monitor ports into the native `virtmic` source node, the
 conferencing app captures the pulse source `virtmic` ("Virtual_Mic"); with
 `mic_mix` the
-real microphone is linked into the same inputs (PipeWire mixes multiple
-feeds), with `monitoring` a loopback duplicates clips to the real speakers.
+real microphone is mixed into the same inputs through the `sbmicmix` mixer
+sink (ADR 0005), with `monitoring` a loopback duplicates clips to the real
+speakers.
 Design decisions: [ADR 0001](docs/adr/0001-pwcat-player-process-model.md)
 (pw-cat process model), [ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md)
 (KDE hotkeys), [ADR 0003](docs/adr/0003-gui-toolkit-gtk4.md) (GUI toolkit),

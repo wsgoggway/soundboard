@@ -16,15 +16,25 @@
 //!   monitor `virtmic.monitor` never showed up);
 //! - links `soundboard:monitor_FL/FR -> virtmic:input_FL/FR` (always; the
 //!   adapter's soft-mixer mixes multiple feeds into one input port);
-//! - links `<real_mic>:capture_FL/FR -> virtmic:input_FL/FR` (only when
-//!   `config.mic_mix`).
+//! - when `config.mic_mix`, the mic path is a THREE-piece mixer chain
+//!   (ADR 0005), not direct mic links:
+//!   1. pulse null-sink `sbmicmix` (description "SB_MicMix") — the mixer;
+//!   2. pulse module-loopback `source=<real_mic> sink=sbmicmix` — keeps the
+//!      mic awake (a SUSPENDED ALSA source has no PipeWire ports, so direct
+//!      `pw-link` to it fails with ENOENT) and resamples properly;
+//!   3. native links `sbmicmix:monitor_FL/FR -> virtmic:input_FL/FR`.
 //!
-//! `real_mic` is the current pulse default source, excluding any `*.monitor`;
-//! its PipeWire node carries the same name (alsa sources keep
-//! `node.name == pulse name`). If it is missing, the mic links are skipped
-//! with a warning. `real_sink` is the current default sink. Both are resolved
-//! at reconcile time, so `soundboard up` re-targets the graph when the user
-//! changes default devices.
+//! `real_mic` NEVER resolves to `virtmic` or a `*.monitor`: with virtmic
+//! as the (common) system default source, direct links would become
+//! `virtmic -> virtmic` SELF-LINKS — the adapter mixes its own monitor
+//! back into its inputs, the level ramps to float saturation and the mic
+//! howls. Resolution prefers the pulse default source, falls back to the
+//! first `alsa_input.*` source; with no candidates the whole mic path is
+//! skipped with a warning.
+//!
+//! `real_sink` is the current default sink. Both are resolved at reconcile
+//! time, so `soundboard up` re-targets the graph when the user changes
+//! default devices.
 //!
 //! NEVER used on purpose (documented broken variants, see the recipe): the
 //! pulse-level `module-null-sink media.class=Audio/Source/Virtual` (registers
@@ -92,6 +102,9 @@ pub const SINK_MEMES: &str = "soundboard";
 /// Monitor source of [`SINK_MEMES`] (pulse alias of the PipeWire monitor
 /// ports); feeds the virtual mic and the optional monitoring loopback.
 pub const SOURCE_MEMES_MONITOR: &str = "soundboard.monitor";
+/// Mixer sink the real mic lands in when `mic_mix` is on (pulse layer, ADR
+/// 0005); its monitor feeds the virtual mic through native links.
+pub const SINK_MIC_MIX: &str = "sbmicmix";
 /// Native PipeWire node name of the virtual microphone; the pulse layer
 /// exposes the same node as capture source [`SOURCE_VIRTMIC`].
 pub const NODE_VIRTMIC: &str = "virtmic";
@@ -105,9 +118,6 @@ pub const VIRTMIC_DESCRIPTION: &str = "Virtual_Mic";
 pub const MEMES_MONITOR_PORTS: [&str; 2] = ["monitor_FL", "monitor_FR"];
 /// Input ports of the [`NODE_VIRTMIC`] node (recipe-verified port names).
 pub const VIRTMIC_INPUT_PORTS: [&str; 2] = ["input_FL", "input_FR"];
-/// Output (capture) ports of the real microphone node (recipe-verified port
-/// names).
-pub const MIC_CAPTURE_PORTS: [&str; 2] = ["capture_FL", "capture_FR"];
 /// Human-readable hint appended to `doctor` output (Russian for the user;
 /// node names stay as the server reports them).
 pub const CONF_HINT: &str = "выбери Virtual_Mic как микрофон в приложении связи \
@@ -145,6 +155,8 @@ pub struct PulseSourceInfo {
 enum Slot {
     SinkMemes,
     LoopbackMonitor,
+    SinkMicMix,
+    LoopbackMicMix,
 }
 
 impl Slot {
@@ -153,6 +165,8 @@ impl Slot {
         match self {
             Slot::SinkMemes => "sink soundboard",
             Slot::LoopbackMonitor => "loopback soundboard.monitor->real-sink",
+            Slot::SinkMicMix => "sink sbmicmix",
+            Slot::LoopbackMicMix => "loopback real-mic->sbmicmix",
         }
     }
 }
@@ -166,12 +180,17 @@ fn classify(module: &ModuleInfo) -> Option<Slot> {
     match module.name.as_str() {
         MODULE_NULL_SINK => match kv.get("sink_name").map(String::as_str) {
             Some(SINK_MEMES) => Some(Slot::SinkMemes),
+            Some(SINK_MIC_MIX) => Some(Slot::SinkMicMix),
             _ => None,
         },
         MODULE_LOOPBACK => {
-            let source = kv.get("source").map(String::as_str);
-            if source == Some(SOURCE_MEMES_MONITOR) {
+            // The mic-mix loopback is identified by its TARGET (the mixer
+            // sink); its source varies with the resolved real mic. The
+            // monitoring loopback keeps its source-side identity.
+            if kv.get("source").map(String::as_str) == Some(SOURCE_MEMES_MONITOR) {
                 Some(Slot::LoopbackMonitor)
+            } else if kv.get("sink").map(String::as_str) == Some(SINK_MIC_MIX) {
+                Some(Slot::LoopbackMicMix)
             } else {
                 None
             }
@@ -444,10 +463,12 @@ fn null_sink_args(sink_name: &str, sink_description: &str) -> String {
 }
 
 /// Builds the desired pulse module list for the current config and session
-/// state.
+/// state. `mic` is the resolved real microphone (`None` = mic_mix on but no
+/// usable mic found — the whole mic-mix chain is skipped with a warning).
 fn desired_pulse_modules(
     backend: &mut dyn PulseBackend,
     cfg: &Config,
+    mic: Option<&ResolvedMic>,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<Vec<Desired>> {
     let mut out = vec![Desired {
@@ -468,15 +489,81 @@ fn desired_pulse_modules(
             ),
         }
     }
+    match (cfg.mic_mix, mic) {
+        (true, Some(mic)) => {
+            out.push(Desired {
+                slot: Slot::SinkMicMix,
+                module: MODULE_NULL_SINK,
+                args: null_sink_args(SINK_MIC_MIX, "SB_MicMix"),
+            });
+            out.push(Desired {
+                slot: Slot::LoopbackMicMix,
+                module: MODULE_LOOPBACK,
+                args: format!("source={} sink={SINK_MIC_MIX}", mic.name),
+            });
+        }
+        (true, None) => warnings.push(
+            "mic_mix включён, но реальный микрофон не найден (все источники — мониторы или virtmic); микшерный синк sbmicmix, loopback и связи пропущены"
+                .to_string(),
+        ),
+        (false, _) => {}
+    }
     Ok(out)
 }
 
-/// The real microphone: current default source, excluding any `*.monitor`.
-fn real_mic(backend: &mut dyn PulseBackend) -> anyhow::Result<Option<String>> {
-    match backend.default_source()? {
-        Some(name) if name.ends_with(".monitor") => Ok(None),
-        other => Ok(other),
+/// The real microphone resolved for the mic-mix path (ADR 0005).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedMic {
+    /// Pulse source name; its PipeWire node carries the same name (alsa
+    /// sources keep `node.name == pulse name`).
+    name: String,
+    /// True when the pulse default source itself was usable (the common
+    /// case); false when the `alsa_input.*` fallback was picked (the default
+    /// was `virtmic`, a monitor or unset).
+    from_default: bool,
+}
+
+/// True when a pulse source may serve as the real microphone: not a monitor
+/// (by flag or by `*.monitor` name) and not the virtual mic itself — a
+/// `virtmic -> virtmic` self-link is a feedback loop, see ADR 0005.
+fn is_real_mic_candidate(name: &str, monitor_of: Option<u32>) -> bool {
+    monitor_of.is_none() && !name.ends_with(".monitor") && name != SOURCE_VIRTMIC
+}
+
+/// Pure real-mic resolution over pulse introspection (unit-testable, ADR
+/// 0005): monitors and `virtmic` are never candidates; the current default
+/// source wins when usable, otherwise the first `alsa_input.*` source is
+/// the fallback. `None` = no usable microphone on the server.
+fn resolve_real_mic(
+    default_source: Option<&str>,
+    sources: &[PulseSourceInfo],
+) -> Option<ResolvedMic> {
+    let candidates: Vec<&PulseSourceInfo> = sources
+        .iter()
+        .filter(|s| is_real_mic_candidate(&s.name, s.monitor_of))
+        .collect();
+    if let Some(name) = default_source
+        && candidates.iter().any(|c| c.name == name)
+    {
+        return Some(ResolvedMic {
+            name: name.to_string(),
+            from_default: true,
+        });
     }
+    candidates
+        .iter()
+        .find(|c| c.name.starts_with("alsa_input."))
+        .map(|c| ResolvedMic {
+            name: c.name.clone(),
+            from_default: false,
+        })
+}
+
+/// Resolves the real microphone from the live pulse server.
+fn real_mic(backend: &mut dyn PulseBackend) -> anyhow::Result<Option<ResolvedMic>> {
+    let default_source = backend.default_source()?;
+    let sources = backend.sources()?;
+    Ok(resolve_real_mic(default_source.as_deref(), &sources))
 }
 
 /// Backend abstraction over libpulse introspection. All methods are
@@ -812,9 +899,10 @@ pub fn parse_pwlink_list(text: &str) -> Vec<NativeLinkInfo> {
 type PortPair = (String, String, String, String);
 
 /// Desired link pairs for the current config: soundboard monitor -> virtmic
-/// (always) plus real mic -> virtmic when `mic` is `Some` (mic_mix on and a
-/// real mic was found).
-fn desired_link_pairs(mic: Option<&str>) -> Vec<PortPair> {
+/// (always) plus the mic-mix mixer `sbmicmix:monitor_*` -> virtmic when
+/// `mic_mix` is on (ADR 0005). Direct `<real_mic>:capture_* -> virtmic`
+/// pairs are NEVER desired (suspended-mic ENOENT + self-loop traps).
+fn desired_link_pairs(mic_mix: bool) -> Vec<PortPair> {
     let mut out = Vec::new();
     for (out_port, in_port) in MEMES_MONITOR_PORTS.iter().zip(VIRTMIC_INPUT_PORTS) {
         out.push((
@@ -824,10 +912,10 @@ fn desired_link_pairs(mic: Option<&str>) -> Vec<PortPair> {
             in_port.to_string(),
         ));
     }
-    if let Some(mic) = mic {
-        for (out_port, in_port) in MIC_CAPTURE_PORTS.iter().zip(VIRTMIC_INPUT_PORTS) {
+    if mic_mix {
+        for (out_port, in_port) in MEMES_MONITOR_PORTS.iter().zip(VIRTMIC_INPUT_PORTS) {
             out.push((
-                mic.to_string(),
+                SINK_MIC_MIX.to_string(),
                 (*out_port).to_string(),
                 NODE_VIRTMIC.to_string(),
                 in_port.to_string(),
@@ -952,11 +1040,14 @@ fn ensure_virtmic_node(
 }
 
 /// Applies the native part of the desired state: virtmic node + feed links.
-/// `mic` is the resolved real-mic name (pulse default source) when mic_mix is
-/// on and a mic exists. Never touches links whose ports are not on our nodes.
+/// `mic_mix` adds the mic-mix mixer pairs `sbmicmix:monitor_* ->
+/// virtmic:input_*` (the sbmicmix sink node must exist — the pulse layer
+/// created it first). Never touches links whose ports are not on our nodes;
+/// pre-existing self-links on virtmic are destroyed by the diff (never
+/// desired, ADR 0005).
 fn native_reconcile(
     native: &mut dyn NativeBackend,
-    mic: Option<&str>,
+    mic_mix: bool,
     state: &mut ModuleState,
     report: &mut Report,
 ) -> anyhow::Result<()> {
@@ -965,33 +1056,32 @@ fn native_reconcile(
     state.retain_native_live(&live_ids);
     state.adopt_native(virtmic_id, NODE_VIRTMIC);
 
-    // Desired pairs; skipped (with a single warning each) when the soundboard
-    // sink or the mic node is missing — the port check below is the second
-    // guard (a present node with unexpected port names).
+    // Desired pairs; the soundboard sink (and, for mic_mix, the sbmicmix
+    // mixer sink) must exist as nodes — a missing one drops its links with a
+    // single warning. The port check below is the second guard (a present
+    // node with unexpected port names).
     let node_id = |name: &str| -> Option<u32> {
         nodes
             .iter()
             .find(|n| n.name.as_deref() == Some(name))
             .map(|n| n.id)
     };
-    let mut desired = match node_id(SINK_MEMES) {
-        Some(_) => desired_link_pairs(match mic {
-            Some(name) if node_id(name).is_some() => Some(name),
-            Some(name) => {
-                report.warnings.push(format!(
-                    "узел микрофона {name} не найден среди PipeWire-узлов — mic-связи пропущены"
-                ));
-                None
-            }
-            None => None,
-        }),
-        None => {
-            report
-                .warnings
-                .push("синк soundboard не найден — связи звука не созданы".to_string());
-            Vec::new()
-        }
-    };
+    let memes_ok = node_id(SINK_MEMES).is_some();
+    let micmix_ok = node_id(SINK_MIC_MIX).is_some();
+    if !memes_ok {
+        report
+            .warnings
+            .push("синк soundboard не найден — связи звука не созданы".to_string());
+    }
+    if mic_mix && !micmix_ok {
+        report
+            .warnings
+            .push("синк sbmicmix не найден — mic-mix связи не созданы".to_string());
+    }
+    let mut desired = desired_link_pairs(mic_mix && micmix_ok);
+    if !memes_ok {
+        desired.retain(|pair| pair.0 != SINK_MEMES);
+    }
 
     // Only create pairs whose ports actually exist (port names are recipe
     // facts; a deviating node must warn, not produce broken pw-link calls).
@@ -1012,6 +1102,23 @@ fn native_reconcile(
             ));
         }
         ok
+    });
+
+    // Self-loop guard: any link whose both ends are on the same node here
+    // would be virtmic feeding itself (its capture ports are its own
+    // monitor); the adapter mixes that back into the inputs and the level
+    // ramps to float saturation — an audible howl. Refuse to create such
+    // pairs, whatever produced them; pre-existing self-links are destroyed
+    // by the diff below (they touch virtmic and are never desired).
+    desired.retain(|pair| {
+        let self_loop = pair.0 == pair.2;
+        if self_loop {
+            report.warnings.push(format!(
+                "связь {}:{}->{}:{} отклонена: замыкание узла на себя (самовозбуждение)",
+                pair.0, pair.1, pair.2, pair.3
+            ));
+        }
+        !self_loop
     });
 
     let existing = native.links()?;
@@ -1075,7 +1182,15 @@ pub fn reconcile_with(
     owned: &ModuleState,
 ) -> anyhow::Result<(Report, ModuleState)> {
     let mut warnings = Vec::new();
-    let desired = desired_pulse_modules(backend, cfg, &mut warnings)?;
+    // The real mic must be resolved BEFORE the desired module list: it is
+    // part of the mic-mix loopback args (and thus of the exact-args
+    // adoption/reload matching). `None` = mic_mix on but nothing usable.
+    let mic = if cfg.mic_mix {
+        real_mic(backend)?
+    } else {
+        None
+    };
+    let desired = desired_pulse_modules(backend, cfg, mic.as_ref(), &mut warnings)?;
     let current = backend.modules()?;
 
     let mut state = owned.clone();
@@ -1165,23 +1280,14 @@ pub fn reconcile_with(
         }
     }
 
-    // Native layer runs after the pulse layer: the soundboard sink must
-    // exist before links onto its monitor ports are created.
-    let mic = if cfg.mic_mix {
-        match real_mic(backend)? {
-            Some(mic) => Some(mic),
-            None => {
-                report.warnings.push(
-                    "mic_mix включён, но реальный микрофон не найден (источник по умолчанию не задан или монитор); mic-связи пропущены"
-                        .to_string(),
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    native_reconcile(native, mic.as_deref(), &mut state, &mut report)?;
+    // Native layer runs after the pulse layer: the soundboard and sbmicmix
+    // sinks must exist before links onto their monitor ports are created.
+    native_reconcile(
+        native,
+        cfg.mic_mix && mic.is_some(),
+        &mut state,
+        &mut report,
+    )?;
 
     Ok((report, state))
 }
@@ -1470,6 +1576,56 @@ fn memes_links_check(native: &mut dyn NativeBackend, name: &str) -> Check {
         .unwrap_or_else(|e| check(name, false, format!("ошибка: {e:#}")))
 }
 
+/// Native doctor check wrapper: the mic-mix mixer links, never fails.
+fn micmix_links_check(native: &mut dyn NativeBackend, name: &str) -> Check {
+    let wanted: Vec<(String, String, String, String)> = MEMES_MONITOR_PORTS
+        .iter()
+        .zip(VIRTMIC_INPUT_PORTS)
+        .map(|(out, input)| {
+            (
+                SINK_MIC_MIX.to_string(),
+                (*out).to_string(),
+                NODE_VIRTMIC.to_string(),
+                input.to_string(),
+            )
+        })
+        .collect();
+    doctor_links(native, name, &wanted)
+        .unwrap_or_else(|e| check(name, false, format!("ошибка: {e:#}")))
+}
+
+/// Doctor check: no self-loop links on the virtmic node (both ends on
+/// `virtmic` — the adapter mixes its own monitor back into its inputs and
+/// the level ramps to float saturation; the mic_mix buzz regression, ADR
+/// 0005). Evaluated on its own, independent of the pulse server.
+fn self_loop_check(native: &mut dyn NativeBackend, name: &str) -> Check {
+    match native.links() {
+        Ok(links) => {
+            let mut loops: Vec<String> = links
+                .iter()
+                .filter(|l| l.out_node == NODE_VIRTMIC && l.in_node == NODE_VIRTMIC)
+                .map(|l| format!("{}:{}->{}:{}", l.out_node, l.out_port, l.in_node, l.in_port))
+                .collect();
+            loops.sort();
+            loops.dedup();
+            if loops.is_empty() {
+                check(name, true, "самопетля не обнаружена".to_string())
+            } else {
+                check(
+                    name,
+                    false,
+                    format!(
+                        "самопетля: {} — виртуальный микрофон замкнут на себя \
+                         (цифровой гул); запусти soundboard up для очистки",
+                        loops.join(", ")
+                    ),
+                )
+            }
+        }
+        Err(e) => check(name, false, format!("ошибка: {e:#}")),
+    }
+}
+
 /// Diagnoses the graph state on both layers; never fails — problems land in
 /// the report. Pulse-side checks are skipped when the pulse server is
 /// unreachable; native-side checks are evaluated independently (they shell
@@ -1485,14 +1641,18 @@ pub fn doctor_with(
         "источник virtmic присутствует и не является монитором (виден приложениям связи)";
     const NAMES_VIRTMIC_NODE: &str = "нативный узел virtmic присутствует (ровно один)";
     const NAMES_MEMES_LINKS: &str = "связи soundboard:monitor_{FL,FR}->virtmic присутствуют";
+    const NAMES_NO_SELF_LOOP: &str = "на virtmic нет самопетли (virtmic->virtmic)";
     const NAMES_REAL_MIC: &str = "реальный микрофон найден";
-    const NAMES_MIC_LINKS: &str = "mic-связи real-mic:capture_{FL,FR}->virtmic присутствуют";
+    const NAMES_SINK_MIC_MIX: &str = "микшерный синк sbmicmix присутствует";
+    const NAMES_LOOPBACK_MIC_MIX: &str = "mic-mix loopback real-mic->sbmicmix присутствует";
+    const NAMES_MICMIX_LINKS: &str = "связи sbmicmix:monitor_{FL,FR}->virtmic присутствуют";
     const NAMES_LOOPBACK_MONITOR: &str =
         "monitoring loopback soundboard.monitor->real-sink присутствует";
 
     // Native-side checks: evaluated independently of the pulse server.
     let native_node_check = native_node_check(native, NAMES_VIRTMIC_NODE);
     let memes_links_check = memes_links_check(native, NAMES_MEMES_LINKS);
+    let no_self_loop_check = self_loop_check(native, NAMES_NO_SELF_LOOP);
 
     let modules = match backend.modules() {
         Err(e) => {
@@ -1502,9 +1662,12 @@ pub fn doctor_with(
             // The native layer does not go through pulse: still evaluated.
             checks.push(native_node_check);
             checks.push(memes_links_check);
+            checks.push(no_self_loop_check);
             checks.push(skipped(NAMES_REAL_MIC));
             if cfg.mic_mix {
-                checks.push(skipped(NAMES_MIC_LINKS));
+                checks.push(skipped(NAMES_SINK_MIC_MIX));
+                checks.push(skipped(NAMES_LOOPBACK_MIC_MIX));
+                checks.push(skipped(NAMES_MICMIX_LINKS));
             }
             if cfg.monitoring {
                 checks.push(skipped(NAMES_LOOPBACK_MONITOR));
@@ -1539,45 +1702,78 @@ pub fn doctor_with(
 
     checks.push(native_node_check);
     checks.push(memes_links_check);
+    checks.push(no_self_loop_check);
 
-    let real_mic_state = real_mic(backend);
+    // Real-mic resolution (ADR 0005): honest about HOW the mic was found —
+    // via the default source or via the alsa_input fallback.
+    let real_mic_state = match (backend.default_source(), backend.sources()) {
+        (Ok(def), Ok(sources)) => {
+            let mic = resolve_real_mic(def.as_deref(), &sources);
+            Ok((def, mic))
+        }
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
     match &real_mic_state {
-        Ok(Some(mic)) => checks.push(check(
+        Ok((_, Some(mic))) if mic.from_default => checks.push(check(
             NAMES_REAL_MIC,
             true,
-            format!("источник по умолчанию: {mic}"),
+            format!("источник по умолчанию: {}", mic.name),
         )),
-        Ok(None) => checks.push(check(
+        Ok((def, Some(mic))) => {
+            let reason = match def {
+                Some(d) => format!("источник по умолчанию ({d}) не подходит — "),
+                None => "источник по умолчанию не задан — ".to_string(),
+            };
+            checks.push(check(
+                NAMES_REAL_MIC,
+                true,
+                format!("{reason}выбран первый реальный источник: {}", mic.name),
+            ));
+        }
+        Ok((_, None)) => checks.push(check(
             NAMES_REAL_MIC,
             false,
-            "источник по умолчанию не задан или является монитором".to_string(),
+            "реальный микрофон не найден: среди источников нет кандидатов \
+             (все — мониторы или virtmic); mic_mix работать не будет"
+                .to_string(),
         )),
         Err(e) => checks.push(check(NAMES_REAL_MIC, false, format!("ошибка: {e:#}"))),
     }
 
     if cfg.mic_mix {
+        checks.push(slot_check(
+            NAMES_SINK_MIC_MIX,
+            &ours_by_slot,
+            Slot::SinkMicMix,
+            &null_sink_args(SINK_MIC_MIX, "SB_MicMix"),
+        ));
         match &real_mic_state {
-            Ok(Some(mic)) => {
-                let mic_wanted: Vec<(String, String, String, String)> = MIC_CAPTURE_PORTS
-                    .iter()
-                    .zip(VIRTMIC_INPUT_PORTS)
-                    .map(|(out, input)| {
-                        (
-                            mic.clone(),
-                            (*out).to_string(),
-                            NODE_VIRTMIC.to_string(),
-                            input.to_string(),
-                        )
-                    })
-                    .collect();
-                checks.push(
-                    doctor_links(native, NAMES_MIC_LINKS, &mic_wanted).unwrap_or_else(|e| {
-                        check(NAMES_MIC_LINKS, false, format!("ошибка: {e:#}"))
-                    }),
-                );
+            Ok((_, Some(mic))) => {
+                let expected = format!("source={} sink={SINK_MIC_MIX}", mic.name);
+                checks.push(slot_check(
+                    NAMES_LOOPBACK_MIC_MIX,
+                    &ours_by_slot,
+                    Slot::LoopbackMicMix,
+                    &expected,
+                ));
             }
-            Ok(None) => checks.push(skipped(NAMES_MIC_LINKS)),
-            Err(_) => checks.push(skipped(NAMES_MIC_LINKS)),
+            Ok((_, None)) => checks.push(check(
+                NAMES_LOOPBACK_MIC_MIX,
+                false,
+                "пропущено: реальный микрофон не найден (см. проверку реального микрофона выше)"
+                    .to_string(),
+            )),
+            Err(_) => checks.push(skipped(NAMES_LOOPBACK_MIC_MIX)),
+        }
+        match &real_mic_state {
+            Ok((_, Some(_))) => checks.push(micmix_links_check(native, NAMES_MICMIX_LINKS)),
+            Ok((_, None)) => checks.push(check(
+                NAMES_MICMIX_LINKS,
+                false,
+                "пропущено: реальный микрофон не найден (см. проверку реального микрофона выше)"
+                    .to_string(),
+            )),
+            Err(_) => checks.push(skipped(NAMES_MICMIX_LINKS)),
         }
     }
 
@@ -1933,8 +2129,8 @@ mod tests {
     }
 
     /// Node/port fixture shared by the native mocks: soundboard (id 100),
-    /// virtmic (id 200), real mic (id 300) with the recipe-verified port
-    /// names.
+    /// virtmic (id 200), real mic (id 300) and the sbmicmix mixer sink
+    /// (id 400) with the recipe-verified port names.
     fn fixture_nodes() -> Vec<NativeNodeInfo> {
         vec![
             NativeNodeInfo {
@@ -1949,6 +2145,10 @@ mod tests {
                 id: 300,
                 name: Some("alsa_input.real".to_string()),
             },
+            NativeNodeInfo {
+                id: 400,
+                name: Some(SINK_MIC_MIX.to_string()),
+            },
         ]
     }
 
@@ -1958,7 +2158,8 @@ mod tests {
         for (node_id, names, direction) in [
             (100_u32, MEMES_MONITOR_PORTS.to_vec(), "out"),
             (200, VIRTMIC_INPUT_PORTS.to_vec(), "in"),
-            (300, MIC_CAPTURE_PORTS.to_vec(), "out"),
+            (300, ["capture_FL", "capture_FR"].to_vec(), "out"),
+            (400, MEMES_MONITOR_PORTS.to_vec(), "out"),
         ] {
             for name in names {
                 out.push(NativePortInfo {
@@ -2116,14 +2317,20 @@ mod tests {
         null_sink_args(SINK_MEMES, "Meme_Soundboard")
     }
 
+    fn micmix_sink_args() -> String {
+        null_sink_args(SINK_MIC_MIX, "SB_MicMix")
+    }
+
     fn loopback_args(source: &str, sink: &str) -> String {
         format!("source={source} sink={sink}")
     }
 
-    /// Pulse backend with only the memes sink; passthroughs off.
+    /// Pulse backend with only the memes sink; passthroughs off. The source
+    /// list carries the real mic so mic-mix resolution has a candidate.
     fn clean_pulse_backend() -> MockBackend {
         MockBackend::new(Some("alsa_output.real"), Some("alsa_input.real"))
             .with_module(MODULE_NULL_SINK, &memes_sink_args())
+            .with_source("alsa_input.real", None)
     }
 
     fn passthroughs_off() -> Config {
@@ -2321,13 +2528,13 @@ virtmic:input_FL
 
     #[test]
     fn link_diff_creates_missing_and_destroys_our_extras() {
-        let desired = desired_link_pairs(None);
-        // Missing FL link: one create. An extra mic link (mic_mix off) and a
-        // foreign mic->alsa-sink link: only the virtmic-touching one is
-        // destroyed.
+        let desired = desired_link_pairs(false);
+        // Missing FL link: one create. An extra mic-mix link (mic_mix off)
+        // and a foreign mic->alsa-sink link: only the virtmic-touching one
+        // is destroyed.
         let existing = vec![
             NativeLinkInfo::new(SINK_MEMES, "monitor_FR", NODE_VIRTMIC, "input_FR"),
-            NativeLinkInfo::new("alsa_input.real", "capture_FL", NODE_VIRTMIC, "input_FL"),
+            NativeLinkInfo::new(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL"),
             NativeLinkInfo::new(
                 "alsa_input.real",
                 "capture_FL",
@@ -2348,12 +2555,12 @@ virtmic:input_FL
                 "input_FL".to_string()
             )
         );
-        assert_eq!(destroys.len(), 1, "only the extra mic->virtmic link");
+        assert_eq!(destroys.len(), 1, "only the extra micmix->virtmic link");
         assert_eq!(
             destroys[0].pair,
             (
-                "alsa_input.real".to_string(),
-                "capture_FL".to_string(),
+                SINK_MIC_MIX.to_string(),
+                "monitor_FL".to_string(),
                 NODE_VIRTMIC.to_string(),
                 "input_FL".to_string()
             )
@@ -2362,12 +2569,12 @@ virtmic:input_FL
 
     #[test]
     fn link_diff_is_noop_when_graph_matches_desire() {
-        let desired = desired_link_pairs(Some("alsa_input.real"));
+        let desired = desired_link_pairs(true);
         let existing = vec![
             NativeLinkInfo::new(SINK_MEMES, "monitor_FL", NODE_VIRTMIC, "input_FL"),
             NativeLinkInfo::new(SINK_MEMES, "monitor_FR", NODE_VIRTMIC, "input_FR"),
-            NativeLinkInfo::new("alsa_input.real", "capture_FL", NODE_VIRTMIC, "input_FL"),
-            NativeLinkInfo::new("alsa_input.real", "capture_FR", NODE_VIRTMIC, "input_FR"),
+            NativeLinkInfo::new(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL"),
+            NativeLinkInfo::new(SINK_MIC_MIX, "monitor_FR", NODE_VIRTMIC, "input_FR"),
         ];
         // Duplicates (pw-link -l lists each link from both endpoints) must
         // not confuse the diff.
@@ -2377,9 +2584,12 @@ virtmic:input_FL
         assert!(diff.is_empty(), "expected no changes, got {diff:?}");
     }
 
+    /// The mic-mix mixer feeds virtmic through sbmicmix monitor ports; the
+    /// real mic itself is NEVER linked natively (ADR 0005: direct links
+    /// break on suspended mics and self-loop when the default is virtmic).
     #[test]
-    fn desired_link_pairs_cover_fl_fr_and_mic() {
-        let pairs = desired_link_pairs(Some("mic.x"));
+    fn desired_link_pairs_cover_fl_fr_and_micmix() {
+        let pairs = desired_link_pairs(true);
         assert_eq!(pairs.len(), 4);
         assert_eq!(
             pairs[0],
@@ -2402,8 +2612,8 @@ virtmic:input_FL
         assert_eq!(
             pairs[2],
             (
-                "mic.x".to_string(),
-                "capture_FL".to_string(),
+                SINK_MIC_MIX.to_string(),
+                "monitor_FL".to_string(),
                 NODE_VIRTMIC.to_string(),
                 "input_FL".to_string()
             )
@@ -2411,13 +2621,19 @@ virtmic:input_FL
         assert_eq!(
             pairs[3],
             (
-                "mic.x".to_string(),
-                "capture_FR".to_string(),
+                SINK_MIC_MIX.to_string(),
+                "monitor_FR".to_string(),
                 NODE_VIRTMIC.to_string(),
                 "input_FR".to_string()
             )
         );
-        assert_eq!(desired_link_pairs(None).len(), 2);
+        assert_eq!(desired_link_pairs(false).len(), 2);
+        assert!(
+            !pairs
+                .iter()
+                .any(|p| p.0.starts_with("alsa_") || p.1.starts_with("capture_")),
+            "no direct mic links may ever be desired: {pairs:?}"
+        );
     }
 
     #[test]
@@ -2473,8 +2689,146 @@ virtmic:input_FL
     }
 
     #[test]
-    fn mic_links_created_when_mic_mix_on() {
+    fn mic_mix_up_loads_mixer_sink_loopback_and_links() {
         let mut backend = clean_pulse_backend();
+        let mut native = clean_native(); // sbmicmix node present (fixture), no micmix links
+        let owned = seed_state(&mut backend, &native);
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let (report, state) =
+            reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("reconcile");
+        assert!(report.warnings.is_empty(), "{report:?}");
+        // 2 pulse Loads (mixer sink + loopback) + 2 link Creates.
+        assert_eq!(report.changes.len(), 4, "report: {report:?}");
+        let loads: Vec<_> = report
+            .changes
+            .iter()
+            .filter(|c| c.action == ChangeAction::Load)
+            .collect();
+        assert_eq!(loads.len(), 2);
+        assert_eq!(loads[0].module, MODULE_NULL_SINK);
+        assert_eq!(loads[0].args, micmix_sink_args());
+        assert_eq!(loads[1].module, MODULE_LOOPBACK);
+        assert_eq!(
+            loads[1].args,
+            loopback_args("alsa_input.real", SINK_MIC_MIX)
+        );
+        let micmix_links: Vec<_> = native
+            .links
+            .iter()
+            .filter(|l| l.out_node == SINK_MIC_MIX && l.in_node == NODE_VIRTMIC)
+            .collect();
+        assert_eq!(micmix_links.len(), 2, "monitor_FL/FR must both be linked");
+        // The real mic is NEVER linked natively (ADR 0005).
+        assert!(
+            !native
+                .links
+                .iter()
+                .any(|l| l.out_node.starts_with("alsa_") || l.out_port.starts_with("capture_"))
+        );
+        assert_eq!(state.modules.len(), 3, "memes sink + 2 micmix modules");
+    }
+
+    #[test]
+    fn mic_mix_off_unloads_mixer_and_destroys_mic_links() {
+        let mut backend = clean_pulse_backend()
+            .with_module(MODULE_NULL_SINK, &micmix_sink_args())
+            .with_module(
+                MODULE_LOOPBACK,
+                &loopback_args("alsa_input.real", SINK_MIC_MIX),
+            );
+        let mut native = clean_native()
+            .with_link(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(SINK_MIC_MIX, "monitor_FR", NODE_VIRTMIC, "input_FR")
+            // Residue of the OLD design: direct mic links must also go.
+            .with_link("alsa_input.real", "capture_FL", NODE_VIRTMIC, "input_FL")
+            .with_link("alsa_input.real", "capture_FR", NODE_VIRTMIC, "input_FR");
+        let owned = seed_state(&mut backend, &native);
+        let (report, _state) =
+            reconcile_with(&mut backend, &mut native, &passthroughs_off(), &owned)
+                .expect("reconcile");
+        // 2 module Unloads + 4 link Destroys (2 micmix + 2 direct mic).
+        assert_eq!(report.changes.len(), 6, "report: {report:?}");
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .filter(|c| c.action == ChangeAction::Unload)
+                .count(),
+            2
+        );
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .filter(|c| c.action == ChangeAction::Destroy)
+                .count(),
+            4
+        );
+        assert!(
+            !native
+                .links
+                .iter()
+                .any(|l| l.out_node == SINK_MIC_MIX || l.out_node == "alsa_input.real")
+        );
+        assert_eq!(native.links.len(), 2, "memes links must survive");
+        assert_eq!(
+            backend.modules().expect("modules").len(),
+            1,
+            "only the memes sink must survive"
+        );
+    }
+
+    /// Old-design migration: direct `<mic>:capture_* -> virtmic:input_*`
+    /// links are no longer desired — `up` with mic_mix on replaces them with
+    /// the mixer chain (and they are destroyed even when the mic resolves to
+    /// the same node the links came from).
+    #[test]
+    fn mic_mix_on_replaces_direct_mic_links_with_mixer_chain() {
+        let mut backend = clean_pulse_backend();
+        let mut native = clean_native()
+            .with_link("alsa_input.real", "capture_FL", NODE_VIRTMIC, "input_FL")
+            .with_link("alsa_input.real", "capture_FR", NODE_VIRTMIC, "input_FR");
+        let owned = seed_state(&mut backend, &native);
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let (report, _state) =
+            reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("reconcile");
+        // 2 Loads + 2 Creates (micmix) + 2 Destroys (direct mic links).
+        assert_eq!(report.changes.len(), 6, "report: {report:?}");
+        assert!(
+            !native
+                .links
+                .iter()
+                .any(|l| l.out_node == "alsa_input.real" && l.in_node == NODE_VIRTMIC),
+            "direct mic links must be gone: {:?}",
+            native.links
+        );
+        assert_eq!(
+            native
+                .links
+                .iter()
+                .filter(|l| l.out_node == SINK_MIC_MIX && l.in_node == NODE_VIRTMIC)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn mic_mix_falls_back_when_default_is_monitor() {
+        let mut backend = clean_pulse_backend();
+        backend.default_source = Some("soundboard.monitor".to_string());
+        backend.sources.push(PulseSourceInfo {
+            index: 90,
+            name: "soundboard.monitor".to_string(),
+            monitor_of: Some(7),
+        });
         let mut native = clean_native();
         let owned = seed_state(&mut backend, &native);
         let cfg = Config {
@@ -2484,47 +2838,39 @@ virtmic:input_FL
         };
         let (report, _state) =
             reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("reconcile");
-        assert!(report.warnings.is_empty(), "{report:?}");
-        assert_eq!(report.changes.len(), 2);
-        for c in &report.changes {
-            assert_eq!(c.action, ChangeAction::Create);
-            assert!(c.slot.contains("alsa_input.real"));
-        }
-        let mic_links: Vec<_> = native
-            .links
-            .iter()
-            .filter(|l| l.out_node == "alsa_input.real" && l.in_node == NODE_VIRTMIC)
-            .collect();
-        assert_eq!(mic_links.len(), 2);
-    }
-
-    #[test]
-    fn mic_links_destroyed_when_mic_mix_off() {
-        let mut backend = clean_pulse_backend();
-        let mut native = clean_native()
-            .with_link("alsa_input.real", "capture_FL", NODE_VIRTMIC, "input_FL")
-            .with_link("alsa_input.real", "capture_FR", NODE_VIRTMIC, "input_FR");
-        let owned = seed_state(&mut backend, &native);
-        let (report, _state) =
-            reconcile_with(&mut backend, &mut native, &passthroughs_off(), &owned)
-                .expect("reconcile");
-        assert_eq!(report.changes.len(), 2);
-        for c in &report.changes {
-            assert_eq!(c.action, ChangeAction::Destroy);
-        }
         assert!(
-            !native
-                .links
-                .iter()
-                .any(|l| l.out_node == "alsa_input.real" && l.in_node == NODE_VIRTMIC)
+            report.warnings.is_empty(),
+            "fallback must be silent: {report:?}"
         );
-        assert_eq!(native.links.len(), 2, "memes links must survive");
+        assert!(
+            backend
+                .modules()
+                .expect("modules")
+                .iter()
+                .any(|m| m.name == MODULE_LOOPBACK
+                    && normalize_args(&m.args)
+                        == normalize_args(&loopback_args("alsa_input.real", SINK_MIC_MIX))),
+            "the alsa_input fallback must feed the mixer sink"
+        );
     }
 
     #[test]
-    fn mic_mix_with_monitor_default_source_warns_and_skips() {
+    fn mic_mix_without_candidates_warns_and_skips() {
         let mut backend = clean_pulse_backend();
-        backend.default_source = Some("soundboard.monitor".to_string());
+        backend.default_source = Some(SOURCE_VIRTMIC.to_string());
+        // Only virtmic and a monitor: no real-mic candidate at all.
+        backend.sources = vec![
+            PulseSourceInfo {
+                index: 10,
+                name: SOURCE_VIRTMIC.to_string(),
+                monitor_of: None,
+            },
+            PulseSourceInfo {
+                index: 11,
+                name: "soundboard.monitor".to_string(),
+                monitor_of: Some(7),
+            },
+        ];
         let mut native = clean_native();
         let owned = seed_state(&mut backend, &native);
         let cfg = Config {
@@ -2536,7 +2882,228 @@ virtmic:input_FL
             reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("reconcile");
         assert!(report.changes.is_empty(), "no changes expected: {report:?}");
         assert_eq!(report.warnings.len(), 1);
-        assert!(!native.links.iter().any(|l| l.out_node == "alsa_input.real"));
+        assert!(
+            report.warnings[0].contains("не найден") && report.warnings[0].contains("sbmicmix"),
+            "warning must name the miss and what is skipped: {:?}",
+            report.warnings
+        );
+        assert!(
+            !native
+                .links
+                .iter()
+                .any(|l| l.out_node == SINK_MIC_MIX && l.in_node == NODE_VIRTMIC)
+        );
+    }
+
+    /// The user-facing regression (ADR 0005): the pulse default source IS
+    /// virtmic on this setup. mic_mix must still work — resolve the real mic
+    /// via the alsa_input fallback — and must never link virtmic onto
+    /// itself.
+    #[test]
+    fn mic_mix_with_virtmic_default_source_falls_back_never_self_links() {
+        let mut backend = clean_pulse_backend();
+        backend.default_source = Some(SOURCE_VIRTMIC.to_string());
+        let mut native = clean_native();
+        let owned = seed_state(&mut backend, &native);
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let (report, _state) =
+            reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("reconcile");
+        assert!(report.warnings.is_empty(), "{report:?}");
+        assert!(
+            backend
+                .modules()
+                .expect("modules")
+                .iter()
+                .any(|m| normalize_args(&m.args)
+                    == normalize_args(&loopback_args("alsa_input.real", SINK_MIC_MIX))),
+            "loopback must come from the fallback mic"
+        );
+        assert!(
+            !native
+                .links
+                .iter()
+                .any(|l| l.out_node == NODE_VIRTMIC && l.in_node == NODE_VIRTMIC),
+            "self-links are forbidden: {:?}",
+            native.links
+        );
+        assert_eq!(
+            native
+                .links
+                .iter()
+                .filter(|l| l.out_node == SINK_MIC_MIX && l.in_node == NODE_VIRTMIC)
+                .count(),
+            2
+        );
+    }
+
+    /// The manually-created self-loop (the buzz regression) is destroyed on
+    /// the next `up` while the rest of the graph is untouched.
+    #[test]
+    fn reconcile_destroys_virtmic_self_loop_on_up() {
+        let mut backend = clean_pulse_backend()
+            .with_module(MODULE_NULL_SINK, &micmix_sink_args())
+            .with_module(
+                MODULE_LOOPBACK,
+                &loopback_args("alsa_input.real", SINK_MIC_MIX),
+            );
+        let mut native = clean_native()
+            .with_link(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(SINK_MIC_MIX, "monitor_FR", NODE_VIRTMIC, "input_FR")
+            .with_link(NODE_VIRTMIC, "capture_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(NODE_VIRTMIC, "capture_FR", NODE_VIRTMIC, "input_FR");
+        let owned = seed_state(&mut backend, &native);
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let (report, _state) =
+            reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("reconcile");
+        let self_links: Vec<_> = native
+            .links
+            .iter()
+            .filter(|l| l.out_node == NODE_VIRTMIC && l.in_node == NODE_VIRTMIC)
+            .collect();
+        assert!(
+            self_links.is_empty(),
+            "self-links must be destroyed: {self_links:?}"
+        );
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .filter(|c| c.action == ChangeAction::Destroy)
+                .count(),
+            2
+        );
+        assert!(
+            report
+                .changes
+                .iter()
+                .all(|c| c.action == ChangeAction::Destroy),
+            "nothing but the two destroys may change: {report:?}"
+        );
+        // Feeds survive: 2 memes + 2 micmix.
+        assert_eq!(native.links.len(), 4);
+    }
+
+    /// A real-mic change must reload ONLY the mic-mix loopback (its args
+    /// carry the source name); the mixer sink and the native links stay.
+    #[test]
+    fn real_mic_change_reloads_loopback_only() {
+        let mut backend = clean_pulse_backend();
+        let mut native = clean_native();
+        let owned = seed_state(&mut backend, &native);
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let (_first, state) =
+            reconcile_with(&mut backend, &mut native, &cfg, &owned).expect("first up");
+        // The user plugs in / switches to another mic and makes it default.
+        backend.default_source = Some("alsa_input.other".to_string());
+        backend.sources.push(PulseSourceInfo {
+            index: 95,
+            name: "alsa_input.other".to_string(),
+            monitor_of: None,
+        });
+        let (second, state2) =
+            reconcile_with(&mut backend, &mut native, &cfg, &state).expect("second up");
+        assert_eq!(second.changes.len(), 1, "{second:?}");
+        assert_eq!(second.changes[0].action, ChangeAction::Reload);
+        assert_eq!(second.changes[0].slot, Slot::LoopbackMicMix.label());
+        assert_eq!(
+            second.changes[0].args,
+            loopback_args("alsa_input.other", SINK_MIC_MIX)
+        );
+        // Mixer sink untouched, links untouched, state consistent.
+        assert!(
+            backend
+                .modules()
+                .expect("modules")
+                .iter()
+                .filter(|m| m.name == MODULE_NULL_SINK)
+                .count()
+                == 2
+        );
+        assert_eq!(native.links.len(), 4);
+        assert_eq!(state2.modules.len(), 3);
+    }
+
+    /// The live-host scenario (ADR 0005 verification): the manually created
+    /// mixer-sink modules and links are already on the server but absent
+    /// from the state file — `up` must ADOPT them (exact args / port pairs)
+    /// and change nothing.
+    #[test]
+    fn live_mic_mix_modules_and_links_are_adopted_noop() {
+        let mut backend = clean_pulse_backend()
+            .with_module(MODULE_NULL_SINK, &micmix_sink_args())
+            .with_module(
+                MODULE_LOOPBACK,
+                &loopback_args("alsa_input.real", SINK_MIC_MIX),
+            );
+        let mut native = clean_native()
+            .with_link(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(SINK_MIC_MIX, "monitor_FR", NODE_VIRTMIC, "input_FR");
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let (report, state) =
+            reconcile_with(&mut backend, &mut native, &cfg, &ModuleState::empty())
+                .expect("reconcile");
+        assert!(report.is_noop(), "adoption must be a no-op: {report:?}");
+        assert_eq!(state.modules.len(), 3);
+        assert_eq!(state.native_nodes.len(), 1);
+        assert_eq!(backend.modules().expect("modules").len(), 3);
+        assert_eq!(native.links.len(), 4);
+        // The adopted state drives teardown.
+        let (down_report, down_state) =
+            teardown_with(&mut backend, &mut native, &state).expect("teardown");
+        // 3 modules + 4 links + 1 node.
+        assert_eq!(down_report.changes.len(), 8);
+        assert!(down_state.modules.is_empty());
+        assert!(backend.modules().expect("modules").is_empty());
+        assert!(native.links.is_empty());
+    }
+
+    /// Defense in depth: whatever produces a self-loop pair, the reconcile
+    /// must refuse to create it — and must destroy a pre-existing self-link
+    /// (the residue of the old buggy binary) because it touches virtmic and
+    /// is never desired.
+    #[test]
+    fn reconcile_never_creates_and_destroys_virtmic_self_links() {
+        let mut backend = clean_pulse_backend();
+        let mut native = clean_native()
+            .with_link(NODE_VIRTMIC, "capture_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(NODE_VIRTMIC, "capture_FR", NODE_VIRTMIC, "input_FR");
+        let owned = seed_state(&mut backend, &native);
+        let (report, _state) =
+            reconcile_with(&mut backend, &mut native, &passthroughs_off(), &owned)
+                .expect("reconcile");
+        let self_links: Vec<_> = native
+            .links
+            .iter()
+            .filter(|l| l.out_node == NODE_VIRTMIC && l.in_node == NODE_VIRTMIC)
+            .collect();
+        assert!(
+            self_links.is_empty(),
+            "self-links must be destroyed: {self_links:?}"
+        );
+        assert_eq!(native.links.len(), 2, "memes links must survive");
+        assert!(
+            report
+                .changes
+                .iter()
+                .all(|c| c.action == ChangeAction::Destroy),
+            "only destroys expected: {report:?}"
+        );
     }
 
     #[test]
@@ -2903,10 +3470,16 @@ virtmic:input_FL
 
     #[test]
     fn doctor_all_pass_on_full_state() {
-        let mut backend = clean_pulse_backend().with_source(SOURCE_VIRTMIC, None);
+        let mut backend = clean_pulse_backend()
+            .with_module(MODULE_NULL_SINK, &micmix_sink_args())
+            .with_module(
+                MODULE_LOOPBACK,
+                &loopback_args("alsa_input.real", SINK_MIC_MIX),
+            )
+            .with_source(SOURCE_VIRTMIC, None);
         let mut native = clean_native()
-            .with_link("alsa_input.real", "capture_FL", NODE_VIRTMIC, "input_FL")
-            .with_link("alsa_input.real", "capture_FR", NODE_VIRTMIC, "input_FR");
+            .with_link(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(SINK_MIC_MIX, "monitor_FR", NODE_VIRTMIC, "input_FR");
         let cfg = Config {
             mic_mix: true,
             monitoring: false,
@@ -2919,9 +3492,156 @@ virtmic:input_FL
             report.render()
         );
         // server, sink, source-not-monitor, native node, memes links,
-        // real mic, mic links
-        assert_eq!(report.checks.len(), 7);
+        // self-loop, real mic, sbmicmix sink, micmix loopback, micmix links
+        assert_eq!(report.checks.len(), 10);
         assert!(report.render().contains(CONF_HINT));
+    }
+
+    /// Doctor on a partial mic-mix state: the mixer pieces are missing and
+    /// must each be reported as failing.
+    #[test]
+    fn doctor_fails_on_partial_mic_mix() {
+        let mut backend = clean_pulse_backend().with_source(SOURCE_VIRTMIC, None);
+        let mut native = clean_native(); // no sbmicmix modules, no micmix links
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let report = doctor_with(&mut backend, &mut native, &cfg);
+        assert!(!report.all_passed());
+        for name_part in [
+            "микшерный синк sbmicmix",
+            "mic-mix loopback",
+            "sbmicmix:monitor",
+        ] {
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.name.contains(name_part))
+                .unwrap_or_else(|| panic!("check {name_part} present: {report:?}"));
+            assert!(!check.passed, "{check:?}");
+        }
+        // The rest of the graph is healthy.
+        let memes = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("soundboard:monitor"))
+            .expect("memes links check");
+        assert!(memes.passed, "{memes:?}");
+    }
+
+    /// The buzz regression check (ADR 0005): a `virtmic:capture_* ->
+    /// virtmic:input_*` self-loop must be flagged as «самопетля».
+    #[test]
+    fn doctor_fails_on_virtmic_self_loop() {
+        let mut backend = clean_pulse_backend();
+        let mut native = clean_native()
+            .with_link(NODE_VIRTMIC, "capture_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(NODE_VIRTMIC, "capture_FR", NODE_VIRTMIC, "input_FR");
+        let cfg = passthroughs_off();
+        let report = doctor_with(&mut backend, &mut native, &cfg);
+        let loop_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("самопетли"))
+            .expect("self-loop check present");
+        assert!(!loop_check.passed, "{loop_check:?}");
+        assert!(
+            loop_check.detail.contains("самопетля")
+                && loop_check
+                    .detail
+                    .contains("virtmic:capture_FL->virtmic:input_FL"),
+            "detail must name the loop: {loop_check:?}"
+        );
+        // Duplicates from the two-endpoint listing must not inflate the list.
+        let clean_report = {
+            let mut backend = clean_pulse_backend();
+            let mut native = clean_native();
+            doctor_with(&mut backend, &mut native, &cfg)
+        };
+        let ok = clean_report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("самопетли"))
+            .expect("self-loop check present");
+        assert!(ok.passed, "{ok:?}");
+    }
+
+    /// With virtmic as the default source (the user's setup) the real-mic
+    /// check must still PASS — honestly naming the alsa_input fallback —
+    /// and the mic-mix checks evaluate against the fallback mic.
+    #[test]
+    fn doctor_real_mic_falls_back_when_default_is_virtmic() {
+        let mut backend = clean_pulse_backend()
+            .with_module(MODULE_NULL_SINK, &micmix_sink_args())
+            .with_module(
+                MODULE_LOOPBACK,
+                &loopback_args("alsa_input.real", SINK_MIC_MIX),
+            )
+            .with_source(SOURCE_VIRTMIC, None);
+        backend.default_source = Some(SOURCE_VIRTMIC.to_string());
+        let mut native = clean_native()
+            .with_link(SINK_MIC_MIX, "monitor_FL", NODE_VIRTMIC, "input_FL")
+            .with_link(SINK_MIC_MIX, "monitor_FR", NODE_VIRTMIC, "input_FR");
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let report = doctor_with(&mut backend, &mut native, &cfg);
+        let mic_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("реальный микрофон"))
+            .expect("real mic check present");
+        assert!(mic_check.passed, "{mic_check:?}");
+        assert!(
+            mic_check.detail.contains("alsa_input.real")
+                && mic_check.detail.contains("первый реальный источник"),
+            "detail must be honest about the fallback: {mic_check:?}"
+        );
+        assert!(report.all_passed(), "{}", report.render());
+    }
+
+    /// No real mic anywhere: the real-mic check FAILs with an actionable
+    /// Russian message; the mic-mix checks are reported as skipped.
+    #[test]
+    fn doctor_real_mic_fails_without_candidates() {
+        let mut backend = clean_pulse_backend();
+        backend.default_source = Some(SOURCE_VIRTMIC.to_string());
+        backend.sources = vec![
+            source(SOURCE_VIRTMIC, None),
+            source("soundboard.monitor", Some(7)),
+        ];
+        let mut native = clean_native();
+        let cfg = Config {
+            mic_mix: true,
+            monitoring: false,
+            ..Config::default()
+        };
+        let report = doctor_with(&mut backend, &mut native, &cfg);
+        let mic_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("реальный микрофон"))
+            .expect("real mic check present");
+        assert!(!mic_check.passed, "{mic_check:?}");
+        assert!(
+            mic_check.detail.contains("не найден") && mic_check.detail.contains("мониторы"),
+            "{mic_check:?}"
+        );
+        for name_part in ["mic-mix loopback", "sbmicmix:monitor"] {
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.name.contains(name_part))
+                .unwrap_or_else(|| panic!("check {name_part} present: {report:?}"));
+            assert!(
+                !check.passed && check.detail.contains("пропущено"),
+                "{check:?}"
+            );
+        }
     }
 
     #[test]
@@ -3011,17 +3731,67 @@ virtmic:input_FL
         assert!(node_check.passed, "{node_check:?}");
     }
 
+    fn source(name: &str, monitor_of: Option<u32>) -> PulseSourceInfo {
+        PulseSourceInfo {
+            index: 1,
+            name: name.to_string(),
+            monitor_of,
+        }
+    }
+
+    /// The usable default source wins outright.
     #[test]
-    fn real_mic_excludes_monitors() {
-        let mut backend = MockBackend::new(None, Some("alsa_input.real"));
-        assert_eq!(
-            real_mic(&mut backend).expect("real_mic"),
-            Some("alsa_input.real".to_string())
-        );
-        backend.default_source = Some("soundboard.monitor".to_string());
-        assert_eq!(real_mic(&mut backend).expect("real_mic"), None);
-        backend.default_source = None;
-        assert_eq!(real_mic(&mut backend).expect("real_mic"), None);
+    fn resolve_real_mic_prefers_usable_default() {
+        let sources = vec![
+            source("alsa_input.first", None),
+            source("alsa_input.second", None),
+        ];
+        let mic = resolve_real_mic(Some("alsa_input.second"), &sources).expect("resolved");
+        assert_eq!(mic.name, "alsa_input.second");
+        assert!(mic.from_default);
+    }
+
+    /// The default source may be virtmic itself (the user's setup, ADR 0005):
+    /// excluded from candidates, resolution falls back to the first
+    /// alsa_input source.
+    #[test]
+    fn resolve_real_mic_skips_virtmic_default() {
+        let sources = vec![
+            source(SOURCE_VIRTMIC, None),
+            source("alsa_input.headset", None),
+            source("alsa_input.mic", None),
+        ];
+        let mic = resolve_real_mic(Some(SOURCE_VIRTMIC), &sources).expect("resolved");
+        assert_eq!(mic.name, "alsa_input.headset");
+        assert!(!mic.from_default);
+    }
+
+    /// Monitors are never candidates (by flag or by name), with any default.
+    #[test]
+    fn resolve_real_mic_excludes_monitors() {
+        let sources = vec![
+            source("soundboard.monitor", Some(7)),
+            source("alsa_input.real", None),
+        ];
+        let mic = resolve_real_mic(Some("soundboard.monitor"), &sources).expect("resolved");
+        assert_eq!(mic.name, "alsa_input.real");
+        assert!(!mic.from_default);
+        // A `*.monitor` name must be excluded even without the monitor flag.
+        let tricky = vec![source("foo.monitor", None), source("alsa_input.real", None)];
+        let mic = resolve_real_mic(Some("foo.monitor"), &tricky).expect("resolved");
+        assert_eq!(mic.name, "alsa_input.real");
+    }
+
+    /// No candidates at all (only virtmic and monitors): resolution fails.
+    #[test]
+    fn resolve_real_mic_none_without_candidates() {
+        let sources = vec![
+            source(SOURCE_VIRTMIC, None),
+            source("sbmicmix.monitor", Some(9)),
+        ];
+        assert_eq!(resolve_real_mic(Some(SOURCE_VIRTMIC), &sources), None);
+        assert_eq!(resolve_real_mic(None, &sources), None);
+        assert_eq!(resolve_real_mic(Some("alsa_input.real"), &[]), None);
     }
 
     #[test]
