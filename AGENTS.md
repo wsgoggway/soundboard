@@ -8,11 +8,16 @@ microphone and plays short meme audio clips into it.
 - Rust (stable via mise; currently rustc 1.97.0 — mise's `rust` is a symlink
   backend to the rustup toolchain in `~/.cargo/bin`, pinned as `stable` in
   `mise.toml`).
-- GTK4 / gtk4-rs + libadwaita — planned for the UI (milestone M2+).
-- `libpulse-binding` — planned for PulseAudio/PipeWire control (M1+).
-- v1 playback strategy: `pw-cat` subprocess as the player (no audio library
-  dependency yet).
-- CLI: clap (derive). Errors: anyhow (app) + thiserror (typed error enums).
+- CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`;
+  graph reconcile over the PulseAudio/PipeWire session via
+  `libpulse-binding`; playback via a `pw-cat` subprocess (`PwCatPlayer`,
+  cross-process stop through `/proc`); clips registry + per-clip-interrupt
+  scheduler.
+- Module ownership state: `$XDG_STATE_HOME/soundboard/modules.json` records
+  the indices we loaded (see `src/graph.rs`); foreign modules are never
+  touched.
+- GTK4 / gtk4-rs + libadwaita — the UI, next milestone (M3).
+- Errors: anyhow (app) + thiserror (typed error enums).
 
 ## Commands
 
@@ -28,10 +33,12 @@ Toolchains come via mise only; never install system packages.
 - `src/main.rs` — entry point (clap parse, app bootstrap)
 - `src/cli.rs` — clap definitions
 - `src/config.rs` — config load (~/.config/soundboard/config.toml)
-- `src/graph.rs` — PipeWire graph management (null-sink, virtual mic, loopbacks)
+- `src/graph.rs` — PipeWire graph management (null-sink, virtual mic, loopbacks) plus module-ownership state
 - `src/player.rs` — clip playback (pw-cat subprocess in v1)
-- `src/meter.rs` — audio level metering
-- `src/ui/` — GTK4/libadwaita UI
+- `src/clips.rs` — clips directory registry
+- `src/scheduler.rs` — per-clip interrupt decisions
+- `src/meter.rs` — audio level metering (M3)
+- `src/ui/` — GTK4/libadwaita UI (M3)
 
 ## Docs
 

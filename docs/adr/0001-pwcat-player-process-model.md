@@ -33,6 +33,12 @@ stops playbacks that a previous (already exited) CLI invocation started.
    player API call — the simplest correct option for the single-threaded CLI
    and the M3 GTK main loop alike.
 
+The two `libc::kill` call sites (`signal_group`/`signal_pid`) are the only
+`unsafe` blocks in the repo and they never create or dereference pointers —
+`kill` receives only scalar pid and signal numbers — so the repo's
+"no `unsafe` without a recorded ADR" rule is respected, and this ADR is that
+record.
+
 ## Alternatives considered
 
 - `pulse`/`libpulse` playback in-process: no decoding for mp3/ogg without an
