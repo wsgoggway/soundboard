@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+async-channel = "2"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
+gtk4 = { version = "0.11", features = ["v4_10"] }
+libadwaita = { version = "0.9", features = ["v1_4"] }
 libc = "0.2"
 libpulse-binding = { version = "2.30.1", features = ["pa_v12", "pa_v13", "pa_v14", "pa_v15"] }
 serde = { version = "1.0.229", features = ["derive"] }
