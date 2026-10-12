@@ -152,16 +152,22 @@ impl PwCatPlayer {
             .stdout(Stdio::null())
             .stderr(stderr_stdio)
             .process_group(0);
-        let child = command.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "player binary '{}' not found (is pipewire-utils installed?)",
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                remove_log_best_effort(&stderr_log);
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(anyhow::anyhow!(
+                        "player binary '{}' not found (is pipewire-utils installed?)",
+                        self.binary.display()
+                    ));
+                }
+                return Err(anyhow::anyhow!(
+                    "failed to spawn {}: {e}",
                     self.binary.display()
-                )
-            } else {
-                anyhow::anyhow!("failed to spawn {}: {e}", self.binary.display())
+                ));
             }
-        })?;
+        };
         let handle = self.alloc_handle();
         Ok((
             handle,
