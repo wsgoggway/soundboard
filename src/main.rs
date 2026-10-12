@@ -155,7 +155,7 @@ fn run() -> Result<ExitCode> {
             let dir = dirs::data_dir()
                 .context("не удалось определить каталог данных (XDG_DATA_HOME или HOME)")?
                 .join("applications");
-            let files = hotkeys::build_files(&entries);
+            let files = hotkeys::build_files(&entries, &hotkeys::exec_binary());
             let outcome = hotkeys::write_desktop_files(&dir, &files)?;
             for name in &outcome.created {
                 println!("создано: {name}");

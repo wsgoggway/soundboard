@@ -115,10 +115,22 @@ pub struct HotkeyFile {
     pub content: String,
 }
 
-/// Builds the desktop file set for the entries: unique deterministic file
-/// names (slug collisions get `-2`, `-3`, ...) and rendered content.
+/// Absolute path of the running soundboard binary, for embedding into
+/// `Exec=` so hotkeys never depend on the session PATH. Falls back to the
+/// bare name when the path is unavailable or not valid UTF-8.
 #[must_use]
-pub fn build_files(entries: &[HotkeyEntry]) -> Vec<HotkeyFile> {
+pub fn exec_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok())
+        .unwrap_or_else(|| String::from("soundboard"))
+}
+
+/// Builds the desktop file set for the entries: unique deterministic file
+/// names (slug collisions get `-2`, `-3`, ...) and rendered content. `binary`
+/// goes into `Exec=` — production callers pass [`exec_binary`].
+#[must_use]
+pub fn build_files(entries: &[HotkeyEntry], binary: &str) -> Vec<HotkeyFile> {
     let mut used: HashSet<String> = HashSet::new();
     entries
         .iter()
@@ -140,7 +152,7 @@ pub fn build_files(entries: &[HotkeyEntry]) -> Vec<HotkeyFile> {
                 file_name,
                 clip: entry.clip.clone(),
                 key: entry.key.clone(),
-                content: render_desktop_file(&entry.clip, &entry.key),
+                content: render_desktop_file(&entry.clip, &entry.key, binary),
             }
         })
         .collect()
@@ -160,19 +172,21 @@ fn sanitize_display_name(name: &str) -> String {
 }
 
 /// Renders the desktop file content for one clip+key (pure, deterministic).
+/// `binary` is quoted via [`escape_exec_arg`], so paths with spaces are safe.
 #[must_use]
-fn render_desktop_file(clip: &str, key: &str) -> String {
+fn render_desktop_file(clip: &str, key: &str, binary: &str) -> String {
     format!(
         "{GENERATOR_MARKER}\n\
          [Desktop Entry]\n\
          Type=Application\n\
          Name=Soundboard: {}\n\
-         Exec=soundboard play {}\n\
+         Exec={} play {}\n\
          NoDisplay=true\n\
          StartupNotify=false\n\
          X-KDE-GlobalAccel-CommandShortcut=true\n\
          X-KDE-Shortcuts={key}\n",
         sanitize_display_name(clip),
+        escape_exec_arg(binary),
         escape_exec_arg(clip)
     )
 }
@@ -505,7 +519,7 @@ mod tests {
     #[test]
     fn file_names_are_unique_on_slug_collision() {
         let entries = assign_keys(&["kot", "kot 2", "Kot"]);
-        let files = build_files(&entries);
+        let files = build_files(&entries, "soundboard");
         let mut names: Vec<&str> = files.iter().map(|f| f.file_name.as_str()).collect();
         names.sort();
         assert_eq!(
@@ -520,16 +534,27 @@ mod tests {
 
     #[test]
     fn desktop_file_content_is_deterministic_and_complete() {
-        let a = render_desktop_file("my clip", "Alt+1");
-        let b = render_desktop_file("my clip", "Alt+1");
+        let a = render_desktop_file("my clip", "Alt+1", "soundboard");
+        let b = render_desktop_file("my clip", "Alt+1", "soundboard");
         assert_eq!(a, b);
         assert!(a.starts_with(GENERATOR_MARKER));
         assert!(a.contains("[Desktop Entry]\n"));
         assert!(a.contains("Name=Soundboard: my clip\n"));
-        assert!(a.contains("Exec=soundboard play \"my clip\"\n"));
+        assert!(a.contains("Exec=\"soundboard\" play \"my clip\"\n"));
         assert!(a.contains("X-KDE-Shortcuts=Alt+1\n"));
         assert!(a.contains("X-KDE-GlobalAccel-CommandShortcut=true\n"));
         assert!(a.contains("NoDisplay=true\n"));
+    }
+
+    #[test]
+    fn desktop_file_embeds_absolute_binary_path_quoted() {
+        let content = render_desktop_file("clip", "Alt+2", "/opt/sb tools/soundboard");
+        assert!(content.contains("Exec=\"/opt/sb tools/soundboard\" play \"clip\"\n"));
+        // Exactly one Exec= line even with a hostile-looking binary path.
+        assert_eq!(
+            content.lines().filter(|l| l.starts_with("Exec=")).count(),
+            1
+        );
     }
 
     #[test]
@@ -543,7 +568,7 @@ mod tests {
     #[test]
     fn desktop_file_name_cannot_inject_keys() {
         let hostile = "x\nExec=xterm\n";
-        let content = render_desktop_file(hostile, "Alt+1");
+        let content = render_desktop_file(hostile, "Alt+1", "soundboard");
         // Exactly one Exec= line — the real one, with the hostile stem
         // safely escaped into a single quoted argument.
         let exec_lines: Vec<&str> = content
@@ -552,15 +577,17 @@ mod tests {
             .collect();
         assert_eq!(
             exec_lines,
-            vec!["Exec=soundboard play \"x\\nExec=xterm\\n\""]
+            vec!["Exec=\"soundboard\" play \"x\\nExec=xterm\\n\""]
         );
         assert!(!content.lines().any(|line| line.starts_with("Exec=xterm")));
         // The hostile text survives only inside the single-line Name value,
         // with the newlines replaced by dashes.
         assert!(content.contains("Name=Soundboard: x-Exec=xterm-\n"));
         // Tabs and other control chars cannot split keys either.
-        assert!(render_desktop_file("a\tb", "Alt+1").contains("Name=Soundboard: a-b\n"));
-        let ctrl = render_desktop_file("p\u{1}q", "Alt+2");
+        assert!(
+            render_desktop_file("a\tb", "Alt+1", "soundboard").contains("Name=Soundboard: a-b\n")
+        );
+        let ctrl = render_desktop_file("p\u{1}q", "Alt+2", "soundboard");
         assert!(ctrl.contains("Name=Soundboard: p-q\n"));
         assert_eq!(
             ctrl.lines()
@@ -608,7 +635,7 @@ mod tests {
     fn write_creates_then_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let entries = assign_keys(&["my clip"]);
-        let files = build_files(&entries);
+        let files = build_files(&entries, "soundboard");
 
         let first = write_desktop_files(dir.path(), &files).expect("write 1");
         assert_eq!(first.created, vec!["net.local.soundboard.my-clip.desktop"]);
@@ -626,16 +653,16 @@ mod tests {
     #[test]
     fn write_updates_with_backup_when_key_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let old = build_files(&assign_keys(&["clip"]));
+        let old = build_files(&assign_keys(&["clip"]), "soundboard");
         write_desktop_files(dir.path(), &old).expect("write old");
 
-        let new = build_files(&assign_keys(&["clip"]));
+        let new = build_files(&assign_keys(&["clip"]), "soundboard");
         // Simulate a changed binding by rewriting content via a new key.
         let changed = new
             .iter()
             .map(|f| HotkeyFile {
                 key: "Alt+5".to_string(),
-                content: render_desktop_file(&f.clip, "Alt+5"),
+                content: render_desktop_file(&f.clip, "Alt+5", "soundboard"),
                 ..f.clone()
             })
             .collect::<Vec<_>>();
@@ -655,7 +682,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let foreign = dir.path().join("net.local.soundboard.clip.desktop");
         std::fs::write(&foreign, "[Desktop Entry]\nType=Application\nName=mine\n").expect("seed");
-        let files = build_files(&assign_keys(&["clip"]));
+        let files = build_files(&assign_keys(&["clip"]), "soundboard");
         let outcome = write_desktop_files(dir.path(), &files).expect("write");
         assert!(outcome.created.is_empty());
         assert_eq!(outcome.skipped.len(), 1);
@@ -674,7 +701,7 @@ mod tests {
 
     #[test]
     fn registration_comparison_covers_all_states() {
-        let desired = build_files(&assign_keys(&["a", "b"]));
+        let desired = build_files(&assign_keys(&["a", "b"]), "soundboard");
         // Nothing desired, nothing present: nothing to do.
         assert_eq!(compare_registration(&[], &[]), Registration::Current);
         // Nothing present while something is desired: not registered.
@@ -707,7 +734,7 @@ mod tests {
             .iter()
             .position(|(name, _)| name == "net.local.soundboard.a.desktop")
             .expect("the a file");
-        changed[a_index].1 = render_desktop_file("a", "Alt+7");
+        changed[a_index].1 = render_desktop_file("a", "Alt+7", "soundboard");
         assert_eq!(
             compare_registration(&changed, &desired),
             Registration::Stale
@@ -723,7 +750,7 @@ mod tests {
             read_managed_files(&path.join("absent")).expect("absent read"),
             Vec::<ManagedFile>::new()
         );
-        let files = build_files(&assign_keys(&["clip one"]));
+        let files = build_files(&assign_keys(&["clip one"]), "soundboard");
         write_desktop_files(path, &files).expect("write");
         // A backup and a foreign lookalike must not count as ours.
         std::fs::write(
@@ -753,7 +780,7 @@ mod tests {
     fn removal_takes_only_marker_checked_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
-        let files = build_files(&assign_keys(&["one", "two"]));
+        let files = build_files(&assign_keys(&["one", "two"]), "soundboard");
         write_desktop_files(path, &files).expect("write ours");
         let foreign = path.join("net.local.soundboard.three.desktop");
         std::fs::write(&foreign, "[Desktop Entry]\nName=mine\n").expect("seed foreign");

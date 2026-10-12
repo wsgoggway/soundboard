@@ -208,7 +208,7 @@ impl HotkeysSection {
             &entries,
             names.len().saturating_sub(entries.len()),
         ));
-        let desired = hotkeys::build_files(&entries);
+        let desired = hotkeys::build_files(&entries, &hotkeys::exec_binary());
         let scan = applications_dir()
             .ok_or_else(|| anyhow::anyhow!("каталог приложений не определён"))
             .and_then(|dir| hotkeys::read_managed_files(&dir));
@@ -668,7 +668,7 @@ pub(crate) fn build(
                 show_toast(&toast_overlay, "Не удалось определить каталог приложений");
                 return;
             };
-            let files = hotkeys::build_files(&entries);
+            let files = hotkeys::build_files(&entries, &hotkeys::exec_binary());
             let handle = gio::spawn_blocking(move || {
                 let outcome = hotkeys::write_desktop_files(&dir, &files);
                 let ksycoca = outcome.is_ok().then(hotkeys::refresh_ksycoca);
