@@ -24,11 +24,12 @@ use thiserror::Error;
 /// Recognized audio file extensions (lowercase; matching is case-insensitive).
 pub const EXTENSIONS: &[&str] = &["wav", "mp3", "ogg", "oga", "flac", "opus", "m4a"];
 
-/// Why a clip name could not be resolved.
+/// Why a clip name could not be resolved. User-facing: messages are Russian
+/// (they surface in the GUI error toast and the CLI stderr).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ResolveError {
     /// No clip matches the query exactly or as a unique prefix.
-    #[error("no clip named '{query}' (available: {available})")]
+    #[error("клип «{query}» не найден (доступны: {available})")]
     NotFound {
         /// The query as typed.
         query: String,
@@ -36,7 +37,7 @@ pub enum ResolveError {
         available: String,
     },
     /// The query is a prefix of several clips.
-    #[error("'{query}' is ambiguous, candidates: {candidates}")]
+    #[error("«{query}» неоднозначно, кандидаты: {candidates}")]
     Ambiguous {
         /// The query as typed.
         query: String,
@@ -70,7 +71,7 @@ impl Clips {
             Ok(entries) => entries,
             Err(e) => {
                 clips.warnings.push(format!(
-                    "cannot read clips directory {}: {e}",
+                    "не удалось прочитать папку клипов {}: {e}",
                     dir.display()
                 ));
                 return clips;
@@ -86,7 +87,7 @@ impl Clips {
                     }
                     files.push(entry.path());
                 }
-                Err(e) => clips.warnings.push(format!("cannot list {dir:?}: {e}")),
+                Err(e) => clips.warnings.push(format!("не удалось получить содержимое {dir:?}: {e}")),
             }
         }
         // Deterministic duplicate handling: sort by file name, first wins.
@@ -100,7 +101,7 @@ impl Clips {
             }
             let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
                 clips.warnings.push(format!(
-                    "skipping file without a readable name: {}",
+                    "пропускаю файл с нечитаемым именем: {}",
                     path.display()
                 ));
                 continue;
@@ -110,7 +111,7 @@ impl Clips {
             }
             if clips.by_name.contains_key(stem) {
                 clips.warnings.push(format!(
-                    "duplicate clip name '{stem}': {} ignored, keeping {}",
+                    "дубликат имени клипа «{stem}»: {} игнорируется, остаётся {}",
                     path.display(),
                     clips.by_name[stem].display()
                 ));
@@ -243,7 +244,7 @@ mod tests {
             Some(dir.path().join("airhorn.mp3").as_path())
         );
         assert_eq!(clips.warnings().len(), 1);
-        assert!(clips.warnings()[0].contains("duplicate clip name 'airhorn'"));
+        assert!(clips.warnings()[0].contains("дубликат имени клипа «airhorn»"));
     }
 
     #[test]
@@ -284,6 +285,7 @@ mod tests {
         let clips = Clips::scan(dir.path());
         let err = clips.resolve("air").expect_err("ambiguous");
         assert!(matches!(err, ResolveError::Ambiguous { .. }));
+        assert!(err.to_string().contains("неоднозначно"), "{err}");
         assert!(err.to_string().contains("airhorn, airhorn_extra"));
     }
 
@@ -294,6 +296,7 @@ mod tests {
         let clips = Clips::scan(dir.path());
         let err = clips.resolve("nope").expect_err("not found");
         assert!(matches!(err, ResolveError::NotFound { .. }));
+        assert!(err.to_string().contains("не найден"), "{err}");
         assert!(err.to_string().contains("airhorn"));
     }
 
@@ -311,7 +314,7 @@ mod tests {
         let clips = Clips::scan(Path::new("/nonexistent/soundboard/clips"));
         assert!(clips.is_empty());
         assert_eq!(clips.warnings().len(), 1);
-        assert!(clips.warnings()[0].contains("cannot read clips directory"));
+        assert!(clips.warnings()[0].contains("не удалось прочитать папку клипов"));
     }
 
     #[test]
