@@ -14,8 +14,11 @@
 //! server down) the setup error is returned synchronously by
 //! [`MeterHandle::start`] — the caller surfaces it once and the meter stays
 //! stopped. If the source disappears mid-run, the pump thread exits silently
-//! and the UI simply freezes at the last value (a restart comes with the
-//! next "repair graph" action in a future slice).
+//! and the UI simply freezes at the last value. Recovery policy (M3b GUI):
+//! the audio worker restarts the meter on EVERY successful `EnsureGraph`
+//! (not only when it never started), so «Починить граф» — and the
+//! mic-mix/monitoring toggles that trigger a reconcile — heal a frozen or
+//! failed meter without an app restart.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -4,42 +4,111 @@
 //! `stop()` up to 2 s, every `PulseSession` call pumps the libpulse
 //! mainloop) — none of them may run on the GTK main thread. This module owns
 //! the solution: one worker thread owns the `PulseSession` + `Graph` +
-//! `PwCatPlayer` (and starts the `MeterHandle`, which spawns its own capture
-//! thread). The UI talks to it via a `std::sync::mpsc` command channel and
-//! listens back over async channels (`async_channel`, sent with
-//! `send_blocking`, drained on the main loop with `spawn_future_local` — the
-//! current gtk4-rs book pattern; `glib::MainContext::channel` was removed in
-//! glib 0.22).
+//! `PwCatPlayer` + clip `Scheduler` (and starts the `MeterHandle`, which
+//! spawns its own capture thread). The UI talks to it via a
+//! `std::sync::mpsc` command channel and listens back over async channels
+//! (`async_channel`, sent with `send_blocking`, drained on the main loop
+//! with `spawn_future_local` — the current gtk4-rs book pattern;
+//! `glib::MainContext::channel` was removed in glib 0.22).
+//!
+//! Config sharing: the UI and the worker hold one [`SharedConfig`]. The UI
+//! mutates fields under the lock (cheap, in-memory); the worker takes a
+//! `clone()` snapshot before every blocking operation, so the UI thread can
+//! never block on audio. Persistence (`Config::save`, a small file write)
+//! happens only on the worker thread (`WorkerCmd::SaveConfig` or shutdown).
+//!
+//! Playback engine (M3b): the worker owns a persistent [`PwCatPlayer`] and a
+//! [`Scheduler`]. `Play { name }` resolves the clip against a fresh
+//! [`Clips::scan`] (a cheap readdir — keeps the registry current without a
+//! rescan command; new files are playable immediately), asks the scheduler
+//! for a decision (per-clip interrupt semantics come from
+//! `config.interrupt_mode`), kills the interrupted handles, starts the new
+//! playback with the current `config.volume` and registers it. Finished
+//! playbacks are reaped after every command AND on a [`REAP_INTERVAL`]
+//! timeout while idle (so a clip that ends on its own un-highlights without
+//! user action); every change publishes [`GuiMsg::PlayingSet`] — the full
+//! set of playing clip names (scheduler-tracked clips only; CLI-spawned
+//! `soundboard play` processes and the 440 Hz test tone are not in the
+//! registry and are ignored by the UI grid, but «Стоп всё» still stops the
+//! scheduler-tracked ones). «Стоп всё» (`Stop { name: None }`) stops only
+//! playbacks this GUI spawned — cross-process stopping stays a CLI feature
+//! (`soundboard stop`) to keep parallel CLI+GUI use predictable.
 //!
 //! Startup auto-setup (core requirement): right after spawn the worker runs
 //! `EnsureGraph` and then `Doctor`, so the graph comes up without user
 //! action and the status rows get their first report.
 //!
-//! Shutdown protocol: `WorkerCmd::Shutdown` → the worker stops the meter,
-//! stops all playbacks and exits its loop; the graph is deliberately NOT
-//! torn down (it must persist for Zoom; only `soundboard down` removes it).
-//! A final `GuiMsg::ShutdownComplete` tells the window it may destroy
-//! itself.
+//! Meter lifecycle: the meter starts once at startup and is RESTARTED on
+//! every successful `EnsureGraph` (unconditionally, not only when it was
+//! never started) — this revives both a meter that failed at startup and one
+//! whose source vanished mid-run (the pump thread exits silently then; see
+//! the `meter` module docs for the frozen-value failure model).
+//!
+//! Shutdown protocol: `WorkerCmd::Shutdown` → the worker persists the
+//! config (the volume slider may have moved), stops the meter and all
+//! playbacks and exits its loop; the graph is deliberately NOT torn down
+//! (it must persist for Zoom; only `soundboard down` removes it). A final
+//! `GuiMsg::ShutdownComplete` tells the window it may destroy itself.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 
+use crate::clips::Clips;
 use crate::config::Config;
 use crate::graph::{DoctorReport, Graph, PulseSession, Report};
 use crate::meter::MeterHandle;
 use crate::player::{Player as _, PwCatPlayer};
+use crate::scheduler::{Decision, PlayRequest, Request, Scheduler, StopRequest};
+
+/// Config shared between the UI thread and the audio worker (see the module
+/// docs for the locking/snapshotting discipline).
+pub type SharedConfig = Arc<Mutex<Config>>;
+
+/// Locks the shared config, healing a poisoned lock: a panicked worker must
+/// not take the whole UI down, and the config is a plain data struct whose
+/// mid-update state is harmless.
+pub fn lock_config(cfg: &SharedConfig) -> MutexGuard<'_, Config> {
+    cfg.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How often the idle worker reaps finished playbacks to keep the UI
+/// playing-set current.
+const REAP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Registry name under which the test tone is tracked in the scheduler (not
+/// a real clip; the UI grid ignores it, «Стоп всё» stops it).
+const TEST_NAME: &str = "Тест 440 Гц";
 
 /// Command from the UI thread to the audio worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerCmd {
-    /// Reconcile the audio graph (startup auto-setup, «Починить граф»).
+    /// Reconcile the audio graph (startup auto-setup, «Починить граф»,
+    /// mic-mix/monitoring toggles). On success the meter is restarted too.
     EnsureGraph,
     /// Run the diagnostics and send the report back.
     Doctor,
     /// Play a 2 s 440 Hz test sine into the `soundboard` sink.
     PlayTest,
-    /// Stop the meter and all playbacks, then exit (graph stays up).
+    /// Play the clip by registry name (file stem); interrupt semantics and
+    /// volume come from the current shared config.
+    Play {
+        /// Registry name of the clip.
+        name: String,
+    },
+    /// Stop one clip (`name: Some`) or every GUI-spawned playback
+    /// (`name: None` = «Стоп всё»).
+    Stop {
+        /// Clip to stop; `None` = stop all.
+        name: Option<String>,
+    },
+    /// Persist the current shared config to disk (worker thread does the
+    /// blocking write; used by the toggles and the volume slider).
+    SaveConfig,
+    /// Stop the meter and all playbacks, persist the config, then exit (the
+    /// graph stays up).
     Shutdown,
 }
 
@@ -53,7 +122,10 @@ pub enum GuiMsg {
     Status(DoctorReport),
     /// Graph reconcile finished; `is_noop()`/`warnings` drive the summary.
     GraphUp(Report),
-    /// A blocking audio operation failed (shown once, UI stays usable).
+    /// Names of the clips currently playing (the UI highlights them in the
+    /// grid). Published whenever the set changes.
+    PlayingSet(Vec<String>),
+    /// A blocking audio operation failed (toast + summary; UI stays usable).
     Error(String),
     /// The worker finished its shutdown; the window may destroy itself.
     ShutdownComplete,
@@ -128,7 +200,7 @@ impl Worker {
     /// Only fails when the thread cannot be spawned at all; audio/graph
     /// problems are reported asynchronously as [`GuiMsg::Error`].
     pub fn spawn(
-        cfg: Config,
+        cfg: SharedConfig,
         ui_tx: async_channel::Sender<GuiMsg>,
         meter_tx: async_channel::Sender<f32>,
     ) -> Result<Worker> {
@@ -152,9 +224,9 @@ impl Worker {
     }
 }
 
-/// Worker thread body: owns the session, graph, player and meter.
+/// Worker thread body: owns the session, graph, player, scheduler and meter.
 fn run_worker(
-    cfg: Config,
+    cfg: SharedConfig,
     cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
     ui: impl Fn(GuiMsg),
     meter_tx: async_channel::Sender<f32>,
@@ -166,48 +238,185 @@ fn run_worker(
         Ok(graph) => graph,
         Err(e) => {
             ui_err(e);
-            // Nothing else can work without a session; still serve Doctor
-            // retries below by re-opening on each command.
-            wait_for_commands_without_session(cfg, cmd_rx, ui);
+            // Nothing else can work without a session; still serve retries
+            // below by re-opening on each command.
+            wait_for_commands_without_session(cfg, cmd_rx, ui, meter_tx);
             return;
         }
     };
-    match graph.reconcile(&cfg) {
+    let snapshot = lock_config(&cfg).clone();
+    match graph.reconcile(&snapshot) {
         Ok(report) => ui(GuiMsg::GraphUp(report)),
         Err(e) => ui_err(e),
     }
-    ui(GuiMsg::Status(graph.doctor(&cfg)));
+    ui(GuiMsg::Status(graph.doctor(&snapshot)));
     let mut meter = start_meter(&ui, &meter_tx);
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            WorkerCmd::EnsureGraph => {
-                match graph.reconcile(&cfg) {
-                    Ok(report) => ui(GuiMsg::GraphUp(report)),
-                    Err(e) => ui_err(e),
+    let mut player = PwCatPlayer::new();
+    let mut scheduler = Scheduler::new();
+    let mut published: Vec<String> = Vec::new();
+
+    loop {
+        match cmd_rx.recv_timeout(REAP_INTERVAL) {
+            Ok(cmd) => match cmd {
+                WorkerCmd::EnsureGraph => {
+                    let snapshot = lock_config(&cfg).clone();
+                    let outcome = graph.reconcile(&snapshot);
+                    let reconcile_ok = outcome.is_ok();
+                    match outcome {
+                        Ok(report) => ui(GuiMsg::GraphUp(report)),
+                        Err(e) => ui_err(e),
+                    }
+                    ui(GuiMsg::Status(graph.doctor(&snapshot)));
+                    // Restart the meter on every SUCCESSFUL repair, even when
+                    // it was already running or had failed earlier: a fresh
+                    // capture stream heals both a source that vanished
+                    // mid-run (the old pump thread exits silently, the bar
+                    // would freeze) and a meter that never started.
+                    if reconcile_ok {
+                        meter_stop(&mut meter);
+                        meter = start_meter(&ui, &meter_tx);
+                    }
                 }
-                ui(GuiMsg::Status(graph.doctor(&cfg)));
-                if meter.is_none() {
-                    meter = start_meter(&ui, &meter_tx);
+                WorkerCmd::Doctor => {
+                    let snapshot = lock_config(&cfg).clone();
+                    ui(GuiMsg::Status(graph.doctor(&snapshot)));
                 }
-            }
-            WorkerCmd::Doctor => {
-                ui(GuiMsg::Status(graph.doctor(&cfg)));
-            }
-            WorkerCmd::PlayTest => {
-                let mut player = PwCatPlayer::new();
-                match write_test_sine()
-                    .and_then(|path| player.play(&path, "Тест 440 Гц", cfg.volume))
-                {
-                    Ok(_handle) => {}
-                    Err(e) => ui_err(e),
+                WorkerCmd::PlayTest => {
+                    let (volume, interrupt) = play_params(&cfg);
+                    match write_test_sine() {
+                        Ok(path) => {
+                            play_clip(
+                                &mut player,
+                                &mut scheduler,
+                                TEST_NAME,
+                                &path,
+                                volume,
+                                interrupt,
+                                &ui_err,
+                            );
+                        }
+                        Err(e) => ui_err(e),
+                    }
+                    publish_playing(&mut player, &mut scheduler, &mut published, &ui);
                 }
+                WorkerCmd::Play { name } => {
+                    let (volume, interrupt) = play_params(&cfg);
+                    // Fresh scan per play: a cheap readdir keeps the registry
+                    // current, so clips added on disk are playable at once.
+                    let clips = Clips::scan(&lock_config(&cfg).clips_dir);
+                    match clips.resolve(&name) {
+                        Ok(clip) => {
+                            play_clip(
+                                &mut player,
+                                &mut scheduler,
+                                clip.name,
+                                clip.path,
+                                volume,
+                                interrupt,
+                                &ui_err,
+                            );
+                        }
+                        Err(e) => ui_err(anyhow::anyhow!("{e}")),
+                    }
+                    publish_playing(&mut player, &mut scheduler, &mut published, &ui);
+                }
+                WorkerCmd::Stop { name } => {
+                    let decision = scheduler.decide(Request::Stop(StopRequest { name }));
+                    if let Decision::Stop(handles) = decision {
+                        for handle in handles {
+                            if let Err(e) = player.stop(handle) {
+                                ui_err(e);
+                            }
+                        }
+                    }
+                    publish_playing(&mut player, &mut scheduler, &mut published, &ui);
+                }
+                WorkerCmd::SaveConfig => {
+                    if let Err(e) = lock_config(&cfg).save() {
+                        ui_err(e);
+                    }
+                }
+                WorkerCmd::Shutdown => break,
+            },
+            // Idle: keep the playing set honest (clips end on their own).
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                publish_playing(&mut player, &mut scheduler, &mut published, &ui);
             }
-            WorkerCmd::Shutdown => break,
+            // The app dropped the command sender: shut down the same way.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // Persist the config (the volume slider may have moved since the last
+    // explicit save), then stop all audio. The graph stays up for Zoom.
+    if let Err(e) = lock_config(&cfg).save() {
+        ui_err(e);
+    }
     meter_stop(&mut meter);
+    if let Err(e) = player.stop_all() {
+        ui_err(e);
+    }
     ui(GuiMsg::ShutdownComplete);
+}
+
+/// Snapshot of the config fields a playback needs.
+fn play_params(cfg: &SharedConfig) -> (f32, bool) {
+    let snapshot = lock_config(cfg);
+    (snapshot.volume, snapshot.interrupt_mode)
+}
+
+/// Runs one play request through the scheduler: kills the interrupted
+/// handles, starts the new playback at `volume` and registers it. A failed
+/// stop of an old handle is surfaced but does not cancel the fresh play.
+fn play_clip(
+    player: &mut PwCatPlayer,
+    scheduler: &mut Scheduler,
+    name: &str,
+    path: &Path,
+    volume: f32,
+    interrupt_mode: bool,
+    ui_err: &impl Fn(anyhow::Error),
+) {
+    let Decision::Start { stop } = scheduler.decide(Request::Play(PlayRequest {
+        name: name.to_string(),
+        interrupt_mode,
+    })) else {
+        return; // play decisions are always Start
+    };
+    for handle in stop {
+        if let Err(e) = player.stop(handle) {
+            ui_err(e);
+        }
+    }
+    match player.play(path, name, volume) {
+        // On spawn failure there is nothing to register: `decide` already
+        // dropped the interrupted handles, so the scheduler stays honest.
+        Ok(handle) => scheduler.started(name, handle),
+        Err(e) => ui_err(e),
+    }
+}
+
+/// Reaps finished playbacks, updates the scheduler and publishes the playing
+/// set when it changed.
+fn publish_playing(
+    player: &mut PwCatPlayer,
+    scheduler: &mut Scheduler,
+    published: &mut Vec<String>,
+    ui: &impl Fn(GuiMsg),
+) {
+    for handle in player.reap() {
+        scheduler.finished(handle);
+    }
+    let playing: Vec<String> = scheduler
+        .active()
+        .into_iter()
+        .map(|(_, name)| name.to_string())
+        .collect();
+    if playing != *published {
+        *published = playing.clone();
+        ui(GuiMsg::PlayingSet(playing));
+    }
 }
 
 fn meter_stop(meter: &mut Option<MeterHandle>) {
@@ -237,25 +446,41 @@ fn start_meter(ui: &impl Fn(GuiMsg), meter_tx: &async_channel::Sender<f32>) -> O
 }
 
 /// Degraded mode when the pulse session could not be opened at startup:
-/// `EnsureGraph`/`Doctor` re-open a session per command, `PlayTest` is
+/// `EnsureGraph`/`Doctor` re-open a session per command, playback is
 /// impossible without a server.
 fn wait_for_commands_without_session(
-    cfg: Config,
+    cfg: SharedConfig,
     cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
     ui: impl Fn(GuiMsg),
+    meter_tx: async_channel::Sender<f32>,
 ) {
     let ui_err = |e: anyhow::Error| ui(GuiMsg::Error(format!("{e:#}")));
+    let mut meter: Option<MeterHandle> = None;
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             WorkerCmd::EnsureGraph | WorkerCmd::Doctor => match open_graph() {
                 Ok(mut graph) => {
-                    if cmd == WorkerCmd::EnsureGraph {
-                        match graph.reconcile(&cfg) {
-                            Ok(report) => ui(GuiMsg::GraphUp(report)),
-                            Err(e) => ui_err(e),
+                    let snapshot = lock_config(&cfg).clone();
+                    let outcome = if cmd == WorkerCmd::EnsureGraph {
+                        match graph.reconcile(&snapshot) {
+                            Ok(report) => {
+                                ui(GuiMsg::GraphUp(report));
+                                true
+                            }
+                            Err(e) => {
+                                ui_err(e);
+                                false
+                            }
                         }
+                    } else {
+                        false
+                    };
+                    ui(GuiMsg::Status(graph.doctor(&snapshot)));
+                    if outcome {
+                        // Same restart-on-repair policy as the healthy loop.
+                        meter_stop(&mut meter);
+                        meter = start_meter(&ui, &meter_tx);
                     }
-                    ui(GuiMsg::Status(graph.doctor(&cfg)));
                 }
                 Err(e) => ui_err(e),
             },
@@ -264,9 +489,25 @@ fn wait_for_commands_without_session(
                     "нет связи с pulse-сервером — тест невозможен"
                 ));
             }
+            WorkerCmd::Play { name } => {
+                ui_err(anyhow::anyhow!(
+                    "нет связи с pulse-сервером — «{name}» не воспроизведён"
+                ));
+            }
+            // Degraded mode never spawned anything: nothing to stop.
+            WorkerCmd::Stop { .. } => {}
+            WorkerCmd::SaveConfig => {
+                if let Err(e) = lock_config(&cfg).save() {
+                    ui_err(e);
+                }
+            }
             WorkerCmd::Shutdown => break,
         }
     }
+    if let Err(e) = lock_config(&cfg).save() {
+        ui_err(e);
+    }
+    meter_stop(&mut meter);
     ui(GuiMsg::ShutdownComplete);
 }
 

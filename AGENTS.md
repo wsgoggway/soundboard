@@ -17,14 +17,22 @@ microphone and plays short meme audio clips into it.
   the indices we loaded (see `src/graph.rs`); foreign modules are never
   touched.
 - GTK4 / gtk4-rs 0.11 (features `v4_10`) + libadwaita 0.9 (feature `v1_4`) —
-  the GUI. Landed in M3a: `src/ui/worker.rs` (one worker thread owns all
-  blocking audio: PulseSession+Graph+PwCatPlayer+meter; UI talks via
-  std mpsc commands + async-channel replies, drained with
+  the GUI. M3a: `src/ui/worker.rs` (one worker thread owns all blocking
+  audio: PulseSession+Graph+PwCatPlayer+Scheduler+meter; UI talks via std
+  mpsc commands + async-channel replies, drained with
   `glib::spawn_future_local` — `glib::MainContext::channel` is gone in
   glib 0.22), `src/meter.rs` (peak meter off `virtmic.monitor` on its own
-  thread), `src/ui/window.rs` (doctor status rows, repair/test buttons, VU
-  `LevelBar`). Clip grid + toggles — next milestone (M3b). User-facing
-  strings are Russian; identifiers/comments English.
+  thread). M3b: worker-side playback engine (`WorkerCmd::Play`/`Stop`/
+  `SaveConfig`, `GuiMsg::PlayingSet`, per-play clip rescan, meter restart on
+  every successful reconcile), shared `SharedConfig` (Arc<Mutex<Config>>;
+  UI mutates, worker snapshots — `Config::save` runs only on the worker),
+  clip grid (FlowBox of buttons, `suggested-action` highlight while
+  playing), volume slider (persists on the next explicit save or shutdown),
+  mic-mix/monitoring/interrupt `SwitchRow`s, error toasts
+  (`adw::ToastOverlay`), graceful SIGINT/SIGTERM (libc handler + atomic +
+  main-loop poll → the same close-request path — glib 0.22 has no unix
+  signal sources). User-facing strings are Russian; identifiers/comments
+  English.
 - Errors: anyhow (app) + thiserror (typed error enums).
 
 ## Commands
