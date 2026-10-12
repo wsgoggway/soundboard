@@ -50,6 +50,9 @@
 //! (it must persist for Zoom; only `soundboard down` removes it). A final
 //! `GuiMsg::ShutdownComplete` tells the window it may destroy itself.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -61,7 +64,7 @@ use crate::config::Config;
 use crate::graph::{DoctorReport, Graph, PulseSession, Report};
 use crate::meter::MeterHandle;
 use crate::player::{Player as _, PwCatPlayer};
-use crate::scheduler::{Decision, PlayRequest, Request, Scheduler, StopRequest};
+use crate::scheduler::{Decision, Handle, PlayRequest, Request, Scheduler, StopRequest};
 
 /// Config shared between the UI thread and the audio worker (see the module
 /// docs for the locking/snapshotting discipline).
@@ -172,16 +175,73 @@ fn wav_bytes(samples: &[i16]) -> Vec<u8> {
     out
 }
 
-/// Path of the generated test file (rewritten on every test playback).
-fn test_sine_path() -> PathBuf {
-    std::env::temp_dir().join("soundboard-test-440hz.wav")
+/// How many names `create_unique_wav` tries before giving up.
+const UNIQUE_CREATE_ATTEMPTS: u32 = 3;
+
+/// Base directory for the generated test wav: the user's runtime directory
+/// (`XDG_RUNTIME_DIR` — per-user, 0700 on systemd) when set and non-empty,
+/// else the shared temp dir as the fallback.
+fn test_runtime_dir() -> PathBuf {
+    test_runtime_dir_from(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
 }
 
+/// [`test_runtime_dir`] with an injectable env value (unit-testable).
+fn test_runtime_dir_from(xdg_runtime_dir: Option<&OsStr>) -> PathBuf {
+    match xdg_runtime_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// Writes the test wav under a unique, freshly created file name and returns
+/// its path. The caller must remove the file once the playback attempt is
+/// over (see `test_files` in `run_worker`).
 fn write_test_sine() -> Result<PathBuf> {
-    let path = test_sine_path();
-    std::fs::write(&path, wav_bytes(&test_sine_samples()))
-        .with_context(|| format!("не удалось записать {}", path.display()))?;
-    Ok(path)
+    create_unique_wav(test_runtime_dir(), wav_bytes(&test_sine_samples()))
+        .context("не удалось записать тестовый wav-файл")
+}
+
+/// Creates `dir/soundboard-test-440hz-<pid>-<nanos>.wav` exclusively
+/// (`create_new`) and fills it with `bytes`, mirroring the
+/// `player::open_stderr_log` pattern: the name is unique per process and
+/// attempt, so two GUI instances never race and a pre-existing symlink at
+/// the path is never followed — the call fails instead and a bumped
+/// nanosecond suffix is tried. The bytes go through the very handle the
+/// call created, never through a second open of the path.
+fn create_unique_wav(dir: PathBuf, bytes: Vec<u8>) -> std::io::Result<PathBuf> {
+    for attempt in 0..UNIQUE_CREATE_ATTEMPTS {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() + attempt)
+            .unwrap_or(attempt);
+        let path = dir.join(format!(
+            "soundboard-test-440hz-{}-{nanos}.wav",
+            std::process::id()
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        file.write_all(&bytes)?;
+        return Ok(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unique test-wav name after retries",
+    ))
+}
+
+/// Drops the wav of a finished/stopped test playback (best effort: a leftover
+/// in the user's runtime dir is cosmetic, not a failure).
+fn remove_test_file(test_files: &mut HashMap<Handle, PathBuf>, handle: Handle) {
+    if let Some(path) = test_files.remove(&handle) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Owner of everything audio; one instance per app, one thread.
@@ -255,6 +315,10 @@ fn run_worker(
     let mut player = PwCatPlayer::new();
     let mut scheduler = Scheduler::new();
     let mut published: Vec<String> = Vec::new();
+    // Wav files of live test playbacks (handle -> path); removed as soon as
+    // the corresponding playback is reaped, stopped or the worker exits —
+    // the file must outlive the pw-cat process reading it.
+    let mut test_files: HashMap<Handle, PathBuf> = HashMap::new();
 
     loop {
         match cmd_rx.recv_timeout(REAP_INTERVAL) {
@@ -285,20 +349,34 @@ fn run_worker(
                 WorkerCmd::PlayTest => {
                     let (volume, interrupt) = play_params(&cfg);
                     match write_test_sine() {
-                        Ok(path) => {
-                            play_clip(
-                                &mut player,
-                                &mut scheduler,
-                                TEST_NAME,
-                                &path,
-                                volume,
-                                interrupt,
-                                &ui_err,
-                            );
-                        }
+                        Ok(path) => match play_clip(
+                            &mut player,
+                            &mut scheduler,
+                            TEST_NAME,
+                            &path,
+                            volume,
+                            interrupt,
+                            &ui_err,
+                        ) {
+                            // Cleanup happens when the playback is reaped or
+                            // stopped; a failed spawn never started reading
+                            // the file, so remove it right away.
+                            Some(handle) => {
+                                test_files.insert(handle, path);
+                            }
+                            None => {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        },
                         Err(e) => ui_err(e),
                     }
-                    publish_playing(&mut player, &mut scheduler, &mut published, &ui);
+                    publish_playing(
+                        &mut player,
+                        &mut scheduler,
+                        &mut published,
+                        &mut test_files,
+                        &ui,
+                    );
                 }
                 WorkerCmd::Play { name } => {
                     let (volume, interrupt) = play_params(&cfg);
@@ -319,7 +397,13 @@ fn run_worker(
                         }
                         Err(e) => ui_err(anyhow::anyhow!("{e}")),
                     }
-                    publish_playing(&mut player, &mut scheduler, &mut published, &ui);
+                    publish_playing(
+                        &mut player,
+                        &mut scheduler,
+                        &mut published,
+                        &mut test_files,
+                        &ui,
+                    );
                 }
                 WorkerCmd::Stop { name } => {
                     let decision = scheduler.decide(Request::Stop(StopRequest { name }));
@@ -328,9 +412,16 @@ fn run_worker(
                             if let Err(e) = player.stop(handle) {
                                 ui_err(e);
                             }
+                            remove_test_file(&mut test_files, handle);
                         }
                     }
-                    publish_playing(&mut player, &mut scheduler, &mut published, &ui);
+                    publish_playing(
+                        &mut player,
+                        &mut scheduler,
+                        &mut published,
+                        &mut test_files,
+                        &ui,
+                    );
                 }
                 WorkerCmd::SaveConfig => {
                     if let Err(e) = lock_config(&cfg).save() {
@@ -341,7 +432,13 @@ fn run_worker(
             },
             // Idle: keep the playing set honest (clips end on their own).
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                publish_playing(&mut player, &mut scheduler, &mut published, &ui);
+                publish_playing(
+                    &mut player,
+                    &mut scheduler,
+                    &mut published,
+                    &mut test_files,
+                    &ui,
+                );
             }
             // The app dropped the command sender: shut down the same way.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -357,6 +454,10 @@ fn run_worker(
     if let Err(e) = player.stop_all() {
         ui_err(e);
     }
+    // Nothing we spawned is alive any more: no test wav may outlive the app.
+    for (_, path) in test_files.drain() {
+        let _ = std::fs::remove_file(path);
+    }
     ui(GuiMsg::ShutdownComplete);
 }
 
@@ -369,6 +470,8 @@ fn play_params(cfg: &SharedConfig) -> (f32, bool) {
 /// Runs one play request through the scheduler: kills the interrupted
 /// handles, starts the new playback at `volume` and registers it. A failed
 /// stop of an old handle is surfaced but does not cancel the fresh play.
+/// Returns the registered handle, or `None` when the spawn failed (nothing
+/// was registered).
 fn play_clip(
     player: &mut PwCatPlayer,
     scheduler: &mut Scheduler,
@@ -377,12 +480,12 @@ fn play_clip(
     volume: f32,
     interrupt_mode: bool,
     ui_err: &impl Fn(anyhow::Error),
-) {
+) -> Option<Handle> {
     let Decision::Start { stop } = scheduler.decide(Request::Play(PlayRequest {
         name: name.to_string(),
         interrupt_mode,
     })) else {
-        return; // play decisions are always Start
+        return None; // play decisions are always Start
     };
     for handle in stop {
         if let Err(e) = player.stop(handle) {
@@ -392,21 +495,29 @@ fn play_clip(
     match player.play(path, name, volume) {
         // On spawn failure there is nothing to register: `decide` already
         // dropped the interrupted handles, so the scheduler stays honest.
-        Ok(handle) => scheduler.started(name, handle),
-        Err(e) => ui_err(e),
+        Ok(handle) => {
+            scheduler.started(name, handle);
+            Some(handle)
+        }
+        Err(e) => {
+            ui_err(e);
+            None
+        }
     }
 }
 
-/// Reaps finished playbacks, updates the scheduler and publishes the playing
-/// set when it changed.
+/// Reaps finished playbacks, updates the scheduler, removes the wav of a
+/// finished test playback and publishes the playing set when it changed.
 fn publish_playing(
     player: &mut PwCatPlayer,
     scheduler: &mut Scheduler,
     published: &mut Vec<String>,
+    test_files: &mut HashMap<Handle, PathBuf>,
     ui: &impl Fn(GuiMsg),
 ) {
     for handle in player.reap() {
         scheduler.finished(handle);
+        remove_test_file(test_files, handle);
     }
     let playing: Vec<String> = scheduler
         .active()
@@ -554,7 +665,48 @@ mod tests {
     }
 
     #[test]
-    fn test_sine_path_is_in_temp_dir() {
-        assert!(test_sine_path().starts_with(std::env::temp_dir()));
+    fn test_runtime_dir_prefers_xdg_and_falls_back_to_temp() {
+        let xdg = OsStr::new("/run/user/1000");
+        assert_eq!(
+            test_runtime_dir_from(Some(xdg)),
+            PathBuf::from("/run/user/1000")
+        );
+        // Empty value is treated as unset.
+        assert_eq!(
+            test_runtime_dir_from(Some(OsStr::new(""))),
+            std::env::temp_dir()
+        );
+        assert_eq!(test_runtime_dir_from(None), std::env::temp_dir());
+    }
+
+    #[test]
+    fn unique_wav_names_never_collide_or_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = wav_bytes(&[1_i16, 2, 3]);
+        let first =
+            create_unique_wav(dir.path().to_path_buf(), bytes.clone()).expect("first write");
+        let second = create_unique_wav(dir.path().to_path_buf(), bytes).expect("second write");
+        // Distinct names, both exist, neither clobbered the other.
+        assert_ne!(first, second, "two writes must not share a file name");
+        assert!(first.is_file());
+        assert!(second.is_file());
+        let expected = wav_bytes(&[1_i16, 2, 3]);
+        assert_eq!(std::fs::read(&first).expect("read first"), expected);
+        assert_eq!(std::fs::read(&second).expect("read second"), expected);
+    }
+
+    #[test]
+    fn write_test_sine_lands_in_runtime_dir_with_wav_content() {
+        let base = test_runtime_dir();
+        let a = write_test_sine().expect("write a");
+        let b = write_test_sine().expect("write b");
+        assert_ne!(a, b);
+        assert!(a.starts_with(&base));
+        assert!(b.starts_with(&base));
+        let data = std::fs::read(&a).expect("read wav");
+        assert_eq!(data, wav_bytes(&test_sine_samples()));
+        // Leave no test artifacts behind.
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
     }
 }
