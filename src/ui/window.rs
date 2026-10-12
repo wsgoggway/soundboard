@@ -22,6 +22,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use async_channel::Receiver;
+use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -35,6 +36,7 @@ use super::worker::{GuiMsg, SharedConfig, Worker, WorkerCmd, lock_config};
 use crate::clips::Clips;
 use crate::config::Config;
 use crate::graph::{CONF_HINT, DoctorReport, Report};
+use crate::hotkeys::{self, Registration};
 
 /// `gtk::Stack` page names (also used for programmatic switches).
 const PAGE_BOARD: &str = "board";
@@ -101,6 +103,151 @@ pub(crate) fn clips_placeholder_text(dir: &Path) -> String {
 /// True when `name` is in the playing set (drives the button highlight).
 pub(crate) fn clip_is_playing(playing: &[String], name: &str) -> bool {
     playing.iter().any(|n| n == name)
+}
+
+/// Russian state line for a desktop-file registration state.
+pub(crate) fn hotkey_state_line(state: Registration) -> &'static str {
+    match state {
+        Registration::Current => "Хоткеи зарегистрированы",
+        Registration::None => "Хоткеи не зарегистрированы",
+        Registration::Stale => "Хоткеи устарели — набор клипов или клавиши изменились",
+    }
+}
+
+/// Label of the register/refresh button for a registration state.
+pub(crate) fn enable_button_label(state: Registration) -> &'static str {
+    match state {
+        Registration::None => "Включить хоткеи",
+        Registration::Current | Registration::Stale => "Обновить хоткеи",
+    }
+}
+
+/// Line shown when there are no clips to bind keys to.
+pub(crate) const NO_CLIPS_LINE: &str = "Клипы не найдены — привязывать нечего";
+
+/// User applications directory for the hotkey desktop files (the same path
+/// the CLI `hotkeys --write` writes to: `XDG_DATA_HOME/applications`).
+fn applications_dir() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|dir| dir.join("applications"))
+}
+
+/// The «Глобальные хоткеи» section of the settings page: the clip → key →
+/// command table, the registration state line (read-only scan of the
+/// applications directory) and the enable/refresh/disable buttons. The
+/// blocking parts (desktop file writes, `kbuildsycoca6`) run on
+/// `gio::spawn_blocking`; `refresh` itself only does a small readdir plus a
+/// few tiny file reads — the same UI-thread precedent as the clip grid scan.
+struct HotkeysSection {
+    container: GtkBox,
+    table: Label,
+    state: Label,
+    register_btn: Button,
+    disable_btn: Button,
+}
+
+/// Caption explaining what the global hotkeys do.
+const HOTKEYS_CAPTION: &str = "Работают в любом приложении, даже когда окно закрыто; клип играет отдельным процессом soundboard play";
+
+impl HotkeysSection {
+    fn new() -> Self {
+        let table = Label::builder()
+            .label("…")
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .selectable(true)
+            .build();
+        // GtkLabel lost its monospace property in GTK4; the Adwaita
+        // `.monospace` style class is the supported way for labels.
+        table.add_css_class("monospace");
+        let state = Label::builder()
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .build();
+        let register_btn = Button::with_label("Включить хоткеи");
+        register_btn.add_css_class("suggested-action");
+        let disable_btn = Button::with_label("Выключить");
+        disable_btn.add_css_class("destructive-action");
+        let buttons = GtkBox::new(Orientation::Horizontal, 8);
+        buttons.append(&register_btn);
+        buttons.append(&disable_btn);
+        let caption = Label::builder()
+            .label(HOTKEYS_CAPTION)
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .build();
+        caption.add_css_class("dim-label");
+        let container = GtkBox::new(Orientation::Vertical, 6);
+        container.append(&heading("Глобальные хоткеи"));
+        container.append(&table);
+        container.append(&state);
+        container.append(&buttons);
+        container.append(&caption);
+        Self {
+            container,
+            table,
+            state,
+            register_btn,
+            disable_btn,
+        }
+    }
+
+    /// A shared handle to the section container for page assembly.
+    fn container(&self) -> GtkBox {
+        self.container.clone()
+    }
+
+    /// Recomputes the table and the registration state from the current
+    /// clips and the applications directory.
+    fn refresh(&self, cfg: &Config) {
+        let clips = Clips::scan(&cfg.clips_dir);
+        let names = clips.list();
+        let entries = hotkeys::assign_keys(&names);
+        self.table.set_text(&hotkeys::render_table(
+            &entries,
+            names.len().saturating_sub(entries.len()),
+        ));
+        let desired = hotkeys::build_files(&entries);
+        let scan = applications_dir()
+            .ok_or_else(|| anyhow::anyhow!("каталог приложений не определён"))
+            .and_then(|dir| hotkeys::read_managed_files(&dir));
+        match scan {
+            Ok(files) => self.apply_state(
+                hotkeys::compare_registration(&files, &desired),
+                !clips.is_empty(),
+            ),
+            Err(_) => self.show_scan_error(),
+        }
+    }
+
+    /// Applies a computed registration state to the state line and buttons.
+    fn apply_state(&self, state: Registration, clips_found: bool) {
+        self.state.set_text(if clips_found {
+            hotkey_state_line(state)
+        } else {
+            NO_CLIPS_LINE
+        });
+        self.state.remove_css_class("success");
+        self.state.remove_css_class("dim-label");
+        if state == Registration::Current && clips_found {
+            self.state.add_css_class("success");
+        } else {
+            self.state.add_css_class("dim-label");
+        }
+        self.register_btn.set_label(enable_button_label(state));
+        self.register_btn.set_sensitive(clips_found);
+        self.disable_btn.set_sensitive(state != Registration::None);
+    }
+
+    /// Fallback when the applications directory cannot be read.
+    fn show_scan_error(&self) {
+        self.state
+            .set_text("Не удалось проверить состояние хоткеев");
+        self.state.remove_css_class("success");
+        self.state.remove_css_class("dim-label");
+        self.register_btn.set_sensitive(true);
+        self.disable_btn.set_sensitive(false);
+    }
 }
 
 /// Shows a short non-blocking notification at the top of the window.
@@ -379,6 +526,9 @@ pub(crate) fn build(
     let dirs_group = adw::PreferencesGroup::new();
     dirs_group.add(&dir_row);
 
+    // Global hotkeys management («Настройки»).
+    let hotkeys_section = Rc::new(HotkeysSection::new());
+
     // --- Page «Саундборд»: daily use -------------------------------------
     let board = page_box();
     board.append(&clips_header);
@@ -392,6 +542,7 @@ pub(crate) fn build(
     // --- Page «Настройки» -------------------------------------------------
     let settings = page_box();
     settings.append(&toggles);
+    settings.append(&hotkeys_section.container());
     settings.append(&dirs_group);
 
     // --- Page «Дебаг»: doctor checks merged with details ------------------
@@ -465,10 +616,13 @@ pub(crate) fn build(
     }
     {
         let grid = grid.clone();
+        let hotkeys = hotkeys_section.clone();
         let cfg = cfg.clone();
         let worker = worker.clone();
         btn_refresh.connect_clicked(move |_btn| {
-            grid.reload(&lock_config(&cfg), &worker);
+            let current = lock_config(&cfg);
+            grid.reload(&current, &worker);
+            hotkeys.refresh(&current);
         });
     }
 
@@ -490,6 +644,129 @@ pub(crate) fn build(
                     show_toast(&toast_overlay, &format!("Не удалось открыть папку: {e}"));
                 }
             }
+        });
+    }
+
+    // «Включить/Обновить хоткеи»: the exact CLI `hotkeys --write` code path
+    // (assign_keys → build_files → write_desktop_files: idempotent, backups,
+    // foreign files never touched), then kbuildsycoca6 so Plasma picks the
+    // files up live. Both block: they run on gio::spawn_blocking.
+    {
+        let section = hotkeys_section.clone();
+        let cfg = cfg.clone();
+        let toast_overlay = toast_overlay.clone();
+        hotkeys_section.register_btn.connect_clicked(move |_btn| {
+            let cfg = lock_config(&cfg).clone();
+            let clips = Clips::scan(&cfg.clips_dir);
+            let entries = hotkeys::assign_keys(&clips.list());
+            if entries.is_empty() {
+                show_toast(&toast_overlay, NO_CLIPS_LINE);
+                return;
+            }
+            let Some(dir) = applications_dir() else {
+                show_toast(&toast_overlay, "Не удалось определить каталог приложений");
+                return;
+            };
+            let files = hotkeys::build_files(&entries);
+            let handle = gio::spawn_blocking(move || {
+                let outcome = hotkeys::write_desktop_files(&dir, &files);
+                let ksycoca = outcome.is_ok().then(hotkeys::refresh_ksycoca);
+                (outcome, ksycoca)
+            });
+            let section = section.clone();
+            let toast_overlay = toast_overlay.clone();
+            let cfg = cfg.clone();
+            glib::spawn_future_local(async move {
+                let Ok((outcome, ksycoca)) = handle.await else {
+                    show_toast(
+                        &toast_overlay,
+                        "Ошибка: операция хоткеев аварийно завершилась",
+                    );
+                    return;
+                };
+                match outcome {
+                    Ok(o) => {
+                        let mut text = format!(
+                            "Хоткеи: создано {}, обновлено {}, без изменений {}",
+                            o.created.len(),
+                            o.updated.len(),
+                            o.unchanged.len()
+                        );
+                        if !o.skipped.is_empty() {
+                            text.push_str(&format!(", пропущено {}", o.skipped.len()));
+                        }
+                        show_toast(&toast_overlay, &text);
+                    }
+                    Err(e) => {
+                        show_toast(&toast_overlay, &format!("Ошибка хоткеев: {e:#}"));
+                    }
+                }
+                if let Some(Err(e)) = ksycoca {
+                    show_toast(
+                        &toast_overlay,
+                        &format!(
+                            "Не удалось выполнить kbuildsycoca6 ({e:#}) — \
+                                 запустите вручную или перелогиньтесь"
+                        ),
+                    );
+                }
+                section.refresh(&cfg);
+            });
+        });
+    }
+
+    // «Выключить»: remove ONLY our marker-checked desktop files, then
+    // kbuildsycoca6; also off the UI thread.
+    {
+        let section = hotkeys_section.clone();
+        let cfg = cfg.clone();
+        let toast_overlay = toast_overlay.clone();
+        hotkeys_section.disable_btn.connect_clicked(move |_btn| {
+            let Some(dir) = applications_dir() else {
+                show_toast(&toast_overlay, "Не удалось определить каталог приложений");
+                return;
+            };
+            let handle = gio::spawn_blocking(move || {
+                let removed = hotkeys::remove_desktop_files(&dir);
+                let ksycoca = removed.is_ok().then(hotkeys::refresh_ksycoca);
+                (removed, ksycoca)
+            });
+            let section = section.clone();
+            let cfg = cfg.clone();
+            let toast_overlay = toast_overlay.clone();
+            glib::spawn_future_local(async move {
+                let Ok((removed, ksycoca)) = handle.await else {
+                    show_toast(
+                        &toast_overlay,
+                        "Ошибка: операция хоткеев аварийно завершилась",
+                    );
+                    return;
+                };
+                match removed {
+                    Ok(files) if files.is_empty() => {
+                        show_toast(&toast_overlay, "Наших hotkey-файлов нет");
+                    }
+                    Ok(files) => {
+                        show_toast(
+                            &toast_overlay,
+                            &format!("Выключено: удалено файлов {}", files.len()),
+                        );
+                    }
+                    Err(e) => {
+                        show_toast(&toast_overlay, &format!("Ошибка хоткеев: {e:#}"));
+                    }
+                }
+                if let Some(Err(e)) = ksycoca {
+                    show_toast(
+                        &toast_overlay,
+                        &format!(
+                            "Не удалось выполнить kbuildsycoca6 ({e:#}) — \
+                             запустите вручную или перелогиньтесь"
+                        ),
+                    );
+                }
+                section.refresh(&lock_config(&cfg));
+            });
         });
     }
 
@@ -545,6 +822,7 @@ pub(crate) fn build(
     );
     let grid_rx = grid.clone();
     let banner_rx = banner.clone();
+    let hotkeys_rx = hotkeys_section.clone();
     let worker_rx = worker.clone();
     let cfg_rx = cfg.clone();
     let toast_rx = toast_overlay.clone();
@@ -563,6 +841,7 @@ pub(crate) fn build(
                     rebuild_check_rows(&checks_rx, &report);
                     banner_rx.set_revealed(!report.all_passed());
                     grid_rx.reload(&lock_config(&cfg_rx), &worker_rx);
+                    hotkeys_rx.refresh(&lock_config(&cfg_rx));
                 }
                 GuiMsg::GraphUp(report) => {
                     set_summary(
@@ -576,6 +855,7 @@ pub(crate) fn build(
                     }
                     banner_rx.set_revealed(!report.warnings.is_empty());
                     grid_rx.reload(&lock_config(&cfg_rx), &worker_rx);
+                    hotkeys_rx.refresh(&lock_config(&cfg_rx));
                 }
                 GuiMsg::PlayingSet(names) => {
                     grid_rx.set_playing(&names);
@@ -611,8 +891,10 @@ pub(crate) fn build(
     install_signal_close_poll(&window);
 
     // Build the grid right away instead of waiting for the first worker
-    // report (scan is a cheap readdir).
+    // report (scan is a cheap readdir); the hotkey section state comes from
+    // the same cheap directory reads.
     grid.reload(&current, worker);
+    hotkeys_section.refresh(&current);
 
     window.present();
     window
@@ -790,5 +1072,28 @@ mod tests {
         assert!(!clip_is_playing(&playing, "air"));
         assert!(!clip_is_playing(&playing, ""));
         assert!(!clip_is_playing(&[], "airhorn"));
+    }
+
+    #[test]
+    fn hotkey_state_lines_cover_all_states() {
+        assert_eq!(
+            hotkey_state_line(Registration::Current),
+            "Хоткеи зарегистрированы"
+        );
+        assert_eq!(
+            hotkey_state_line(Registration::None),
+            "Хоткеи не зарегистрированы"
+        );
+        assert!(hotkey_state_line(Registration::Stale).contains("устарели"));
+    }
+
+    #[test]
+    fn enable_button_labels_and_sensitivity_follow_state() {
+        assert_eq!(enable_button_label(Registration::None), "Включить хоткеи");
+        assert_eq!(enable_button_label(Registration::Stale), "Обновить хоткеи");
+        assert_eq!(
+            enable_button_label(Registration::Current),
+            "Обновить хоткеи"
+        );
     }
 }

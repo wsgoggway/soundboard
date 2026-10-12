@@ -304,6 +304,135 @@ fn backup_stamp() -> u128 {
     }
 }
 
+/// Registration state of our desktop files in the applications directory,
+/// as shown and acted on by the GUI hotkeys section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    /// No managed files exist (nothing registered).
+    None,
+    /// The files on disk exactly match the desired set.
+    Current,
+    /// Managed files exist but differ from the desired set: some are
+    /// missing, extra, or content-stale. (A desired name blocked by a
+    /// foreign file shows up as [`Registration::None`] when no other
+    /// managed files exist — the registration attempt then reports the
+    /// skip in its outcome.)
+    Stale,
+}
+
+/// One managed desktop file found on disk: (file name, full content).
+pub type ManagedFile = (String, String);
+
+/// File-name prefix shared by every desktop file we generate.
+fn managed_prefix() -> &'static str {
+    "net.local.soundboard."
+}
+
+/// Reads our managed desktop files from `dir`: files named
+/// `net.local.soundboard.*.desktop` whose content starts with the generator
+/// marker. Backup files (`*.bak.<stamp>`) never match the suffix; foreign
+/// files (same name pattern, no marker) are skipped — [`compare_registration`]
+/// still reports [`Registration::Stale`] for them via the name mismatch.
+/// A missing directory reads as "nothing registered".
+///
+/// # Errors
+/// Only when the directory exists but cannot be listed.
+pub fn read_managed_files(dir: &Path) -> Result<Vec<ManagedFile>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("не удалось прочитать {}", dir.display()))?;
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(_) => continue, // unreadable dirent: treat that file as absent
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(managed_prefix()) || !name.ends_with(".desktop") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && content.starts_with(GENERATOR_MARKER)
+        {
+            files.push((name.to_string(), content));
+        }
+    }
+    Ok(files)
+}
+
+/// Compares the managed files found on disk against the desired set: name
+/// sets must be equal and every content must match byte-for-byte (content
+/// is deterministic per `(clip, key)`, so this is exactly "clip set + keys
+/// match").
+#[must_use]
+pub fn compare_registration(existing: &[ManagedFile], desired: &[HotkeyFile]) -> Registration {
+    if existing.is_empty() {
+        if desired.is_empty() {
+            // Nothing desired and nothing present: nothing to do.
+            Registration::Current
+        } else {
+            Registration::None
+        }
+    } else if existing.len() != desired.len() {
+        Registration::Stale
+    } else {
+        let desired: std::collections::HashMap<&str, &str> = desired
+            .iter()
+            .map(|f| (f.file_name.as_str(), f.content.as_str()))
+            .collect();
+        if existing
+            .iter()
+            .all(|(name, content)| desired.get(name.as_str()) == Some(&content.as_str()))
+        {
+            Registration::Current
+        } else {
+            Registration::Stale
+        }
+    }
+}
+
+/// Removes only our managed desktop files from `dir`: same marker check as
+/// [`write_desktop_files`], so foreign files and backups are never touched.
+/// Returns the removed file names.
+///
+/// # Errors
+/// Only when the directory exists but cannot be listed.
+pub fn remove_desktop_files(dir: &Path) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for (name, _) in read_managed_files(dir)? {
+        match std::fs::remove_file(dir.join(&name)) {
+            Ok(()) => removed.push(name),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("не удалось удалить {name}"));
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Refreshes the ksycoca database so a running Plasma picks up our desktop
+/// file changes live (see `docs/kde-hotkeys.md`): `kbuildsycoca6` signals
+/// `databaseChanged` and the shortcut daemon re-reads the files — no
+/// re-login needed. Must not be called from the UI thread (spawns a
+/// process and waits for it).
+///
+/// # Errors
+/// When the binary is missing, cannot be spawned, or exits non-zero.
+pub fn refresh_ksycoca() -> Result<()> {
+    let status = std::process::Command::new("kbuildsycoca6")
+        .status()
+        .context("не удалось запустить kbuildsycoca6")?;
+    if !status.success() {
+        anyhow::bail!("kbuildsycoca6 завершился с ошибкой: {status}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +670,112 @@ mod tests {
         assert!(steps.contains("Параметры системы"));
         assert!(steps.contains("Команда или сценарий"));
         assert!(steps.contains("soundboard hotkeys --write"));
+    }
+
+    #[test]
+    fn registration_comparison_covers_all_states() {
+        let desired = build_files(&assign_keys(&["a", "b"]));
+        // Nothing desired, nothing present: nothing to do.
+        assert_eq!(compare_registration(&[], &[]), Registration::Current);
+        // Nothing present while something is desired: not registered.
+        assert_eq!(compare_registration(&[], &desired), Registration::None);
+        // Exact match (order-independent).
+        let mut on_disk: Vec<ManagedFile> = desired
+            .iter()
+            .map(|f| (f.file_name.clone(), f.content.clone()))
+            .collect();
+        on_disk.reverse();
+        assert_eq!(
+            compare_registration(&on_disk, &desired),
+            Registration::Current
+        );
+        // An extra stale file of ours: stale.
+        let mut extra = on_disk.clone();
+        extra.push((
+            "net.local.soundboard.gone.desktop".to_string(),
+            String::new(),
+        ));
+        assert_eq!(compare_registration(&extra, &desired), Registration::Stale);
+        // A desired file missing on disk: stale.
+        assert_eq!(
+            compare_registration(&on_disk[..1], &desired),
+            Registration::Stale
+        );
+        // Same name set but different key inside: stale.
+        let mut changed = on_disk.clone();
+        let a_index = changed
+            .iter()
+            .position(|(name, _)| name == "net.local.soundboard.a.desktop")
+            .expect("the a file");
+        changed[a_index].1 = render_desktop_file("a", "Alt+7");
+        assert_eq!(
+            compare_registration(&changed, &desired),
+            Registration::Stale
+        );
+    }
+
+    #[test]
+    fn managed_file_scan_is_marker_and_name_checked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        // Nothing there, and not even a directory: empty, not an error.
+        assert_eq!(
+            read_managed_files(&path.join("absent")).expect("absent read"),
+            Vec::<ManagedFile>::new()
+        );
+        let files = build_files(&assign_keys(&["clip one"]));
+        write_desktop_files(path, &files).expect("write");
+        // A backup and a foreign lookalike must not count as ours.
+        std::fs::write(
+            path.join("net.local.soundboard.clip-one.desktop.bak.123"),
+            "backup",
+        )
+        .expect("backup");
+        std::fs::write(
+            path.join("net.local.soundboard.clip-one.desktop"),
+            "[Desktop Entry]\nName=mine\n",
+        )
+        .expect("foreign overwrite is blocked by the writer, seed manually");
+        assert_eq!(
+            read_managed_files(path).expect("read managed"),
+            Vec::<ManagedFile>::new()
+        );
+        // The desired name is now occupied by a foreign file and none of
+        // our files remain: the state reads as "not registered"; a
+        // registration attempt reports the skip in its outcome.
+        assert_eq!(
+            compare_registration(&read_managed_files(path).expect("read"), &files),
+            Registration::None
+        );
+    }
+
+    #[test]
+    fn removal_takes_only_marker_checked_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        let files = build_files(&assign_keys(&["one", "two"]));
+        write_desktop_files(path, &files).expect("write ours");
+        let foreign = path.join("net.local.soundboard.three.desktop");
+        std::fs::write(&foreign, "[Desktop Entry]\nName=mine\n").expect("seed foreign");
+        let backup = path.join("net.local.soundboard.one.desktop.bak.42");
+        std::fs::write(&backup, "old").expect("seed backup");
+        let removed = remove_desktop_files(path).expect("remove");
+        let mut names = removed;
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "net.local.soundboard.one.desktop",
+                "net.local.soundboard.two.desktop"
+            ]
+        );
+        assert!(foreign.is_file(), "foreign file must survive");
+        assert!(backup.is_file(), "backups must survive");
+        assert_eq!(
+            compare_registration(&read_managed_files(path).expect("read"), &files),
+            Registration::None
+        );
+        // Idempotent: a second run removes nothing.
+        assert!(remove_desktop_files(path).expect("remove 2").is_empty());
     }
 }

@@ -111,6 +111,20 @@ X-KDE-Shortcuts=Alt+N
   an overwrite the previous content is backed up next to the file with a
   timestamp suffix.
 
+## In-app management (GUI)
+
+The GUI's «Настройки» view manages the same files in-process (no CLI
+needed): it renders the clip → key table from the current clips, detects
+the registration state by scanning `~/.local/share/applications/` for our
+marker-checked `net.local.soundboard.*.desktop` files and comparing the
+name+content set against the desired one («Хоткеи зарегистрированы» /
+«Хоткеи не зарегистрированы» / «Хоткеи устарели — …»), writes the files
+through the exact same `write_desktop_files` path as `--write`
+(idempotent, backups, foreign files never touched) and then runs
+`kbuildsycoca6` automatically. «Выключить» removes only our marker-checked
+files (backups and foreign lookalikes survive) and refreshes ksycoca. The
+activation rules in the next section apply unchanged.
+
 ## Activation
 
 - Live pickup (usual case): run `kbuildsycoca6` — the daemon sees the ksycoca

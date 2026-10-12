@@ -15,12 +15,15 @@ microphone: Zoom, Google Meet, Telegram, Jitsi, Discord, …
   `up`/`down`/`doctor` management. Conferencing apps list it as a real
   microphone (they filter monitor sources — exactly why the native node is
   used).
-- GTK4/libadwaita GUI: clip grid with playing highlight, live VU meter,
-  volume, mic-mix / hear-yourself / re-click-interrupt toggles, error toasts.
+- GTK4/libadwaita GUI on a three-view `gtk::Stack` («Саундборд» daily
+  board, «Настройки», «Дебаг»): clip grid with playing highlight, live VU
+  meter, volume, mic-mix / hear-yourself / re-click-interrupt toggles, a
+  failure banner that jumps to the debug view, error toasts.
 - CLI playback (`play`/`stop`) that works across processes, including
   stopping playbacks started by an earlier command.
 - Per-clip interrupt or overlap playback modes; clips auto-rescan from disk.
-- KDE Plasma 6 global hotkeys (`Alt+1..9`) via generated `.desktop` files.
+- KDE Plasma 6 global hotkeys (`Alt+1..9`) via generated `.desktop` files,
+  managed in-app («Настройки» → «Глобальные хоткеи») or from the CLI.
 - Russian user-facing strings, English identifiers and docs.
 
 ## Architecture
@@ -80,7 +83,7 @@ bare command, so `~/.cargo/bin` must be on your `PATH` for hotkeys to work.
 
 | Command | What it does |
 |---|---|
-| `soundboard` (no subcommand) | GTK4/libadwaita GUI: auto-reconciles the graph at startup, doctor status rows, VU meter, clip grid, volume, behavior toggles; leaves the graph running on close. |
+| `soundboard` (no subcommand) | GTK4/libadwaita GUI (three views: «Саундборд» / «Настройки» / «Дебаг»): auto-reconciles the graph at startup, clip grid + VU meter + volume on the board view, toggles + global hotkeys + clips dir on settings, merged doctor checks + repair buttons on debug; leaves the graph running on close. |
 | `soundboard up` | Create or repair the audio graph (idempotent reconcile; prints applied changes). |
 | `soundboard down` | Unload soundboard's modules; foreign modules are never touched. |
 | `soundboard doctor` | Check the graph state; exit code 1 when problems are found. |
@@ -113,8 +116,12 @@ clips (sorted) map to `Alt+1`…`Alt+9`. `soundboard hotkeys --write`
 generates idempotent, marker-checked
 `~/.local/share/applications/net.local.soundboard.<slug>.desktop` files
 (`X-KDE-Shortcuts=Alt+N`); foreign files are never touched, overwrites are
-backed up. Activate with `kbuildsycoca6` (or re-login). Details and Plasma
-internals: [`docs/kde-hotkeys.md`](docs/kde-hotkeys.md),
+backed up. Activate with `kbuildsycoca6` (or re-login). The same management
+lives in the app: **Настройки → «Глобальные хоткеи»** shows the table and
+the registration state (registered / not registered / stale), **Включить /
+Обновить** writes the files and runs `kbuildsycoca6` for you, **Выключить**
+removes only soundboard's own files. Details and Plasma internals:
+[`docs/kde-hotkeys.md`](docs/kde-hotkeys.md),
 [ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md).
 
 ## Manual e2e checklist
@@ -136,8 +143,9 @@ Verified once per release on the real desktop session:
 8. Ctrl+C (or closing the window) exits gracefully — config saved,
    playbacks and meter stopped, **the graph stays up** for the conferencing
    app.
-9. `soundboard hotkeys --write` + `kbuildsycoca6`, then `Alt+1` plays the
-   first clip (sorted) even with another window focused.
+9. `soundboard hotkeys --write` + `kbuildsycoca6` (or **Настройки →
+   «Включить хоткеи»** in the app), then `Alt+1` plays the first clip
+   (sorted) even with another window focused.
 
 ## Troubleshooting
 

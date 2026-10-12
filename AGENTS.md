@@ -21,8 +21,11 @@ Jitsi, Discord, …).
   clip → `Alt+N` → command table + manual Plasma 6 steps; `--write` generates
   `~/.local/share/applications/net.local.soundboard.<slug>.desktop` files
   (`X-KDE-Shortcuts=Alt+N`, generator marker, timestamped backups, never
-  touches foreign files or `kglobalshortcutsrc`). Design + sources:
-  `docs/kde-hotkeys.md`.
+  touches foreign files or `kglobalshortcutsrc`). The GUI «Настройки» view
+  manages the same files in-process: registration-state scan
+  (`compare_registration`/`read_managed_files`), enable/refresh via the same
+  `write_desktop_files` path + `kbuildsycoca6`, marker-checked removal.
+  Design + sources: `docs/kde-hotkeys.md`.
 - Module/node ownership state: `$XDG_STATE_HOME/soundboard/modules.json`
   (schema v2) records the pulse module indices and native node ids we
   created (see `src/graph.rs`); native matching is by `node.name`/port
@@ -42,8 +45,14 @@ Jitsi, Discord, …).
   mic-mix/monitoring/interrupt `SwitchRow`s, error toasts
   (`adw::ToastOverlay`), graceful SIGINT/SIGTERM (libc handler + atomic +
   main-loop poll → the same close-request path — glib 0.22 has no unix
-  signal sources). User-facing strings are Russian; identifiers/comments
-  English.
+  signal sources). M5: the window is a three-page `gtk::Stack`
+  («Саундборд» / «Настройки» / «Дебаг») switched by a `StackSwitcher` in
+  the HeaderBar (NOT a Notebook); «Саундборд» = grid + stop-all + volume +
+  VU meter + CONF_HINT, «Настройки» = toggles + «Глобальные хоткеи»
+  management + clips-dir row (xdg-open), «Дебаг» = doctor checks with their
+  detail lines inline + repair buttons; a window-level `AdwBanner` shows
+  only on doctor failures/warnings and jumps to «Дебаг». User-facing
+  strings are Russian; identifiers/comments English.
 - Errors: anyhow (app) + thiserror (typed error enums).
 
 ## Commands
