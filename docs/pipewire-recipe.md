@@ -1,25 +1,40 @@
-# PipeWire virtual microphone recipe (M1 contract)
+# PipeWire virtual microphone recipe (M1/M7 contract)
 
 Live-verified on the host user audio session: CachyOS, PipeWire 1.6.9
-(`pactl 17.0-98-gb096`), PulseAudio-compatible layer. Verified 2026-10-12.
-This file is the CONTRACT for `graph.rs` (M1) — code against these exact
-names and commands.
+(`pactl 17.0-98-gb096`), PulseAudio-compatible layer. Pulse-level parts
+verified 2026-10-12; the native `Audio/Source/Virtual` recipe verified the
+same day by the research slice and by M7 live tests. This file is the
+CONTRACT for `graph.rs` — code against these exact names and commands.
 
-## Working recipe (verified)
+## Working recipe (verified, current design — ADR 0004)
+
+The graph spans two layers. The virtual mic is a NATIVE PipeWire node; the
+pulse layer only provides the playback sink and the optional monitoring
+loopback.
 
 ```bash
-# 1. Soundboard sink (clips are played into this)
+# 1. Soundboard sink (clips are played into this) — pulse layer
 pactl load-module module-null-sink sink_name=soundboard \
   media.class=Audio/Sink sink_properties=device.description=Meme_Soundboard
 
-# 2. Virtual microphone = plain null-sink; apps capture its monitor
-pactl load-module module-null-sink sink_name=virtmic \
-  media.class=Audio/Sink \
-  sink_properties=device.description=Virtual_Mic_sink \
-  source_properties=device.description=Virtual_Mic
+# 2. Virtual microphone — NATIVE PipeWire node (pw-cli, not pactl)
+#    (argv form; no shell, no quotes around values)
+pw-cli create-node adapter '{ factory.name=support.null-audio-sink \
+  node.name=virtmic media.class=Audio/Source/Virtual \
+  node.description=Virtual_Mic audio.position=[ FL, FR ] \
+  object.linger=true }'
 
-# 3. Route soundboard monitor into the virtual mic
-pactl load-module module-loopback source=soundboard.monitor sink=virtmic
+# 3. Feed the virtual mic from the soundboard monitor — always
+pw-link soundboard:monitor_FL virtmic:input_FL
+pw-link soundboard:monitor_FR virtmic:input_FR
+
+# 4. Pass the real mic through — only when mic_mix is on
+pw-link alsa_input.pci-....Mic__source:capture_FL virtmic:input_FL
+pw-link alsa_input.pci-....Mic__source:capture_FR virtmic:input_FR
+
+# 5. Local monitoring — only when monitoring is on (pulse layer)
+pactl load-module module-loopback source=soundboard.monitor \
+  sink=<default_sink>
 ```
 
 Playback into the graph (v1 player, pw-cat):
@@ -28,57 +43,125 @@ Playback into the graph (v1 player, pw-cat):
 pw-cat --playback --target soundboard /path/to/clip.wav
 ```
 
-## Exact names as PulseAudio sees them (node ids differ per session)
+### pw-cli / pw-link syntax traps (research-verified)
 
-| Pulse object | Name               | Notes                                             |
-|--------------|--------------------|---------------------------------------------------|
-| sink         | `soundboard`       | description "Meme_Soundboard"                     |
-| source       | `soundboard.monitor` | monitor of the soundboard sink                  |
-| sink         | `virtmic`          | description "Virtual_Mic_sink"                    |
-| source       | `virtmic.monitor`  | THIS is what Zoom selects; description "Virtual_Mic" |
+- NO quotes around property values — `node.description=Virtual_Mic`, not
+  `node.description="Virtual Mic"`. Inside the braced SPA-JSON payload
+  quotes change the meaning and the value would carry the quote characters.
+- `audio.position` MUST be the array form `[ FL, FR ]` (one argv token with
+  spaces inside the brackets is fine). A bare comma form
+  (`audio.position=FL,FR`) breaks SPA-JSON parsing.
+- Do NOT set `monitor.channel-volumes` on the node: in live tests it
+  corrupted the device description and the channel map.
+- `pw-cli create-node` prints NOTHING on success and returns 0 — silence is
+  success, do not retry and do not treat empty output as failure. The new
+  node id is discovered by re-listing nodes (`pw-cli ls Node`) and matching
+  `node.name`.
+- `object.linger=true` keeps the node alive after pw-cli exits.
 
-Quirk: `source_name=virtmic` is IGNORED for null-sink monitors on PipeWire
-1.6.9 — the monitor source always gets the `.monitor` suffix. Capture apps
-must select `virtmic.monitor`. All four nodes negotiate
-`float32le 2ch 48000Hz`.
+### Why a native node (the Zoom problem)
 
-## Failed variants (do NOT use — live-tested, both broken)
+Zoom FILTERS monitor sources from its microphone list. The old pulse design
+(null-sink `virtmic` captured via its monitor `virtmic.monitor`) produced a
+source that Zoom never offered — user-confirmed on the device picker
+screenshot. The native `Audio/Source/Virtual` node is exposed by
+pipewire-pulse as a REAL source named `virtmic` — «Monitor of Sink: n/a»,
+with the HARDWARE flag — and THIS source is what Zoom lists as
+"Virtual_Mic" (ADR 0004 has the full decision record).
 
-1. `module-null-sink media.class=Audio/Source/Virtual sink_name=virtmic`:
-   PipeWire registers NO pulse sink for the virtual source, so
+## Exact names as the pulse layer sees them
+
+| Pulse object | Name                 | Notes                                                      |
+|--------------|----------------------|------------------------------------------------------------|
+| sink         | `soundboard`         | description "Meme_Soundboard"; clips play here             |
+| source       | `soundboard.monitor` | monitor of the soundboard sink; feeds the links/loopbacks  |
+| source       | `virtmic`            | **NOT a monitor** — the native node itself; THIS is what Zoom selects as "Virtual_Mic" |
+
+The native node has NO pulse owner module — it cannot be unloaded via
+`pactl`; teardown is `pw-cli destroy <node-id>` (see below). The node and
+its links die with the pipewire daemon restart (same lifecycle as pulse
+modules).
+
+## Port names (verified)
+
+| Node                    | Ports (DSP `32 bit float mono audio`) |
+|-------------------------|----------------------------------------|
+| `soundboard`            | outputs `monitor_FL`, `monitor_FR`     |
+| `virtmic`               | inputs `input_FL`, `input_FR`          |
+| real mic (`alsa_input.…`) | outputs `capture_FL`, `capture_FR`   |
+
+Multiple feeds into the same `virtmic` input port are MIXED by the
+adapter's soft-mixer (research-verified: two 440 Hz + 1 kHz tones summed,
+both recovered at 0.5 FS) — that is why mic pass-through does not need a
+separate mixing node.
+
+## Discovery / teardown
+
+```bash
+# Nodes (match id + node.name=virtmic among the entries)
+pw-cli ls Node
+# Links (port-pair listing; each link appears under BOTH endpoints,
+# `|->` marks the output side, `|<-` the input side)
+pw-link -l
+
+# Teardown: our links first (same pairs as creation), then the node
+pw-link -d soundboard:monitor_FL virtmic:input_FL
+pw-link -d soundboard:monitor_FR virtmic:input_FR
+pw-link -d alsa_input...:capture_FL virtmic:input_FL   # when present
+pw-link -d alsa_input...:capture_FR virtmic:input_FR   # when present
+pw-cli destroy <virtmic-node-id>
+
+# pulse layer teardown as before
+pactl unload-module <index>
+```
+
+`soundboard down` does exactly this (links by port pair, node by id from
+the name match) and never touches links between ports that are not on our
+nodes.
+
+## Failed variants (do NOT use — live-tested, broken)
+
+1. **Pulse-level `module-null-sink` with
+   `media.class=Audio/Source/Virtual`** (the pre-M7 design): PipeWire
+   registers NO pulse sink for the virtual source, so
    `module-loopback ... sink=virtmic` **silently falls back to the default
    sink** (audio would play out of the real speakers and the mic stays
    silent). `pw-loopback --playback virtmic` is re-targeted to the default
    sink by WirePlumber as well (playback streams may not target
-   Source/Virtual nodes).
-2. `pw-loopback --capture soundboard.monitor ...`: `soundboard.monitor` is a
-   PulseAudio alias, not a PipeWire node name — the capture half binds to the
-   default mic instead. Native pw-loopback needs
-   `--capture-props '{ node.target = "soundboard", stream.capture.sink = true }'`
-   and even then the playback half mis-binds (see 1).
+   Source/Virtual nodes). NOTE: `media.class=Audio/Source/Virtual` itself is
+   VALID — but only through the NATIVE pw-cli path above, where nothing
+   needs a pulse sink: the node IS the source. The broken part was driving
+   it (and feeding it) through the pulse module layer.
+2. `pw-loopback` (either direction): the capture half mis-binds
+   (`soundboard.monitor` is a PulseAudio alias, not a PipeWire node name —
+   it binds to the default mic unless
+   `--capture-props '{ node.target = "soundboard", stream.capture.sink =
+   true }'` is used) and the playback half mis-binds (see 1). Plain
+   `pw-link` port pairs are exact and are what the reconciler uses.
 3. `pw-record --target <pulse source alias>`: on this setup pw-record ignores
    the target and records from the default microphone (verified: capture
    stream bound to `Source: 55`, the real mic, while asking for virtmic).
-   For tests use `parec -d virtmic.monitor`, which binds exactly
-   (verified `Source: 40719` = virtmic.monitor).
+   For tests use `parec -d virtmic`, which binds exactly.
 
 ## End-to-end signal proof (verified numbers)
 
 4 s 440 Hz sine, 0.5 FS amplitude, 48 kHz mono wav, played with
-`pw-cat --playback --target soundboard`; captured with
-`parec --format=s16le --rate=48000 --channels=2 -d virtmic.monitor`:
+`pw-cat --playback --target soundboard`; captured from the native source
+with `parec --format=s16le --rate=48000 --channels=2 -d virtmic`:
 
-- capture binding: pulse `Source: 40719` = `virtmic.monitor` (exact)
-- peak: **16383 / 32768 = 0.500 FS** (equals the generated amplitude exactly)
-- RMS over a 1 s in-signal window: **11584 = 0.3535 FS** (= 0.5/sqrt(2),
-  the signature of a pure 0.5-FS sine)
+- capture binding: pulse `Source` = the native virtmic node (exact)
+- peak: **0.500 FS** (equals the generated amplitude exactly; the s16
+  stream reads 16383/32768)
+- RMS over a 1 s in-signal window: **0.3535 FS** (= 0.5/sqrt(2), the
+  signature of a pure 0.5-FS sine)
+
+(Re-verified in M7 live tests on the new topology — see the M7 journal.)
 
 ## pw-cat decode support (verified 2026-10-12)
 
 Live check: 1 s 440 Hz sine per format, played with
-`pw-cat --playback --target soundboard --volume 1.0`, captured from
-`virtmic.monitor` (`parec --format=s16le --rate=48000 --channels=2`), peak of
-the raw s16 stream:
+`pw-cat --playback --target soundboard --volume 1.0`, captured peak of the
+raw s16 stream:
 
 | format | generator                       | peak (FS) | verdict |
 |--------|---------------------------------|-----------|---------|
@@ -91,31 +174,17 @@ the raw s16 stream:
 known-unplayable. The `--volume` flag is documented by `pw-cat --help`
 ("Stream volume 0-1.0") and is passed by the player explicitly.
 
-## Extra loopback checks (verified loading cleanly)
+## Post-teardown verification
+
+`soundboard down` is complete when ALL of the following are empty:
 
 ```bash
-# real mic -> virtual mic (for pass-through mode)
-pactl load-module module-loopback \
-  source=alsa_input.pci-0000_00_1f.3-platform-sof_sdw.HiFi__Mic__source \
-  sink=virtmic
-
-# soundboard monitor -> default sink (for local monitoring)
-pactl load-module module-loopback source=soundboard.monitor \
-  sink=alsa_output.usb-XREAL_XREAL_1S-05.analog-stereo
-```
-
-Both loaded and unloaded cleanly (default device names are session-specific —
-discover them at runtime via `pactl get-default-sink` / `pactl get-default-source`).
-
-## Teardown (mandatory)
-
-```bash
-for m in $(pactl list short modules | grep -E 'soundboard|virtmic' | awk '{print $1}'); do
-  pactl unload-module "$m"
-done
-# verify empty:
 pactl list short modules | grep -E 'soundboard|virtmic'
+pactl list short sinks   | grep -E 'soundboard'
+pactl list short sources | grep -E 'soundboard|virtmic'
+pw-cli ls Node | grep 'node.name = "virtmic"'
+pw-link -l | grep -B1 virtmic
 ```
 
-Post-teardown verification on 2026-10-12: no `soundboard`/`virtmic` modules,
-sinks, sources, or `pw-loopback` processes remained.
+(A native node has no pulse owner module, so the pulse module grep alone is
+NOT enough — the `pw-cli ls Node` check is mandatory.)

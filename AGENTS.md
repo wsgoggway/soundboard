@@ -9,8 +9,10 @@ microphone and plays short meme audio clips into it.
   backend to the rustup toolchain in `~/.cargo/bin`, pinned as `stable` in
   `mise.toml`).
 - CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`;
-  graph reconcile over the PulseAudio/PipeWire session via
-  `libpulse-binding`; playback via a `pw-cat` subprocess (`PwCatPlayer`,
+  graph reconcile over two layers (pulse via `libpulse-binding`: null-sink
+  `soundboard` + optional monitoring loopback; native via `pw-cli`/`pw-link`
+  subprocesses: the `Audio/Source/Virtual` node `virtmic` + pw-link feeds,
+  ADR 0004); playback via a `pw-cat` subprocess (`PwCatPlayer`,
   cross-process stop through `/proc`); clips registry + per-clip-interrupt
   scheduler.
 - KDE hotkeys (M4): `src/hotkeys.rs` — `soundboard hotkeys` prints a Russian
@@ -19,16 +21,17 @@ microphone and plays short meme audio clips into it.
   (`X-KDE-Shortcuts=Alt+N`, generator marker, timestamped backups, never
   touches foreign files or `kglobalshortcutsrc`). Design + sources:
   `docs/kde-hotkeys.md`.
-- Module ownership state: `$XDG_STATE_HOME/soundboard/modules.json` records
-  the indices we loaded (see `src/graph.rs`); foreign modules are never
-  touched.
+- Module/node ownership state: `$XDG_STATE_HOME/soundboard/modules.json`
+  (schema v2) records the pulse module indices and native node ids we
+  created (see `src/graph.rs`); native matching is by `node.name`/port
+  pairs, foreign modules and links are never touched.
 - GTK4 / gtk4-rs 0.11 (features `v4_10`) + libadwaita 0.9 (feature `v1_4`) —
   the GUI. M3a: `src/ui/worker.rs` (one worker thread owns all blocking
   audio: PulseSession+Graph+PwCatPlayer+Scheduler+meter; UI talks via std
   mpsc commands + async-channel replies, drained with
   `glib::spawn_future_local` — `glib::MainContext::channel` is gone in
-  glib 0.22), `src/meter.rs` (peak meter off `virtmic.monitor` on its own
-  thread). M3b: worker-side playback engine (`WorkerCmd::Play`/`Stop`/
+  glib 0.22), `src/meter.rs` (peak meter off `virtmic` — the native source
+  — on its own thread). M3b: worker-side playback engine (`WorkerCmd::Play`/`Stop`/
   `SaveConfig`, `GuiMsg::PlayingSet`, per-play clip rescan, meter restart on
   every successful reconcile), shared `SharedConfig` (Arc<Mutex<Config>>;
   UI mutates, worker snapshots — `Config::save` runs only on the worker),
@@ -48,9 +51,10 @@ microphone and plays short meme audio clips into it.
 - `just lint` — `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings`
 - `just run` — `cargo run`
 - `cargo run --example vu_probe -- [source]` — live peak probe of a pulse
-  source (default `virtmic.monitor`), ~10 lines/sec, Ctrl+C to stop; the
-  debugging tool for the virtual mic meter (self-contained: the crate has
-  no lib target, so it mirrors `src/meter.rs` instead of importing it)
+  source (default `virtmic`, the native virtual mic), ~10 lines/sec,
+  Ctrl+C to stop; the debugging tool for the virtual mic meter
+  (self-contained: the crate has no lib target, so it mirrors
+  `src/meter.rs` instead of importing it)
 
 Toolchains come via mise only; never install system packages.
 
@@ -60,7 +64,7 @@ Toolchains come via mise only; never install system packages.
 - `src/cli.rs` — clap definitions
 - `src/hotkeys.rs` — KDE Plasma hotkey table + `.desktop` generation (M4)
 - `src/config.rs` — config load (~/.config/soundboard/config.toml)
-- `src/graph.rs` — PipeWire graph management (null-sink, virtual mic, loopbacks) plus module-ownership state
+- `src/graph.rs` — PipeWire graph management (pulse null-sink + monitoring loopback; native `Audio/Source/Virtual` node `virtmic` + pw-link feeds) plus module/node-ownership state
 - `src/player.rs` — clip playback (pw-cat subprocess in v1)
 - `src/clips.rs` — clips directory registry
 - `src/scheduler.rs` — per-clip interrupt decisions
@@ -72,8 +76,9 @@ Toolchains come via mise only; never install system packages.
 
 - `README.md` — user-facing overview: install, quick start, CLI reference,
   troubleshooting, manual e2e checklist.
-- `docs/pipewire-recipe.md` — CONTRACT for M1: the live-verified PipeWire
-  module recipe (exact commands, node names, teardown).
+- `docs/pipewire-recipe.md` — CONTRACT for the graph: the live-verified
+  two-layer recipe (pulse modules + native pw-cli node, exact commands,
+  port names, SPA-JSON traps, teardown).
 - `docs/kde-hotkeys.md` — CONTRACT for M4: how Plasma 6 registers command
   shortcuts (research findings, sources, the `--write` design).
 - `docs/adr/` — architecture decision records.

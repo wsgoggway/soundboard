@@ -1,14 +1,18 @@
 # soundboard
 
 A Rust + GTK4 soundboard for Zoom on Linux: it creates a PipeWire virtual
-microphone (`virtmic.monitor`, shown to apps as **Virtual_Mic**) and plays
-short meme audio clips into it, so a keypress or click "says" it straight
-into the call while your real microphone keeps working.
+microphone (the native `Audio/Source/Virtual` node `virtmic`, shown to apps
+as **Virtual_Mic**) and plays short meme audio clips into it, so a keypress
+or click "says" it straight into the call while your real microphone keeps
+working.
 
 ## Features
 
-- PipeWire virtual microphone built from verified null-sinks + loopbacks
-  (see `docs/pipewire-recipe.md`) — idempotent `up`/`down`/`doctor` management.
+- PipeWire virtual microphone built as a native `Audio/Source/Virtual`
+  node plus `pw-link` feeds (see `docs/pipewire-recipe.md`,
+  [ADR 0004](docs/adr/0004-virtmic-native-source-node.md)) — idempotent
+  `up`/`down`/`doctor` management. Zoom lists it as a real microphone
+  (Zoom filters monitor sources — exactly why the native node is used).
 - GTK4/libadwaita GUI: clip grid with playing highlight, live VU meter,
   volume, mic-mix / hear-yourself / re-click-interrupt toggles, error toasts.
 - CLI playback (`play`/`stop`) that works across processes, including
@@ -21,20 +25,24 @@ into the call while your real microphone keeps working.
 
 Overview, component responsibilities and the verified audio topology
 diagram live in [`docs/hld.md`](docs/hld.md). Short version: clips are
-played by a `pw-cat` subprocess into the `soundboard` null-sink, a loopback
-routes its monitor into the `virtmic` null-sink, Zoom captures
-`virtmic.monitor`; optional loopbacks pass the real mic through
-(`mic_mix`) or duplicate clips to the real speakers (`monitoring`).
+played by a `pw-cat` subprocess into the `soundboard` null-sink, `pw-link`
+routes its monitor ports into the native `virtmic` source node, Zoom
+captures the pulse source `virtmic` ("Virtual_Mic"); with `mic_mix` the
+real microphone is linked into the same inputs (PipeWire mixes multiple
+feeds), with `monitoring` a loopback duplicates clips to the real speakers.
 Design decisions: [ADR 0001](docs/adr/0001-pwcat-player-process-model.md)
 (pw-cat process model), [ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md)
-(KDE hotkeys), [ADR 0003](docs/adr/0003-gui-toolkit-gtk4.md) (GUI toolkit).
+(KDE hotkeys), [ADR 0003](docs/adr/0003-gui-toolkit-gtk4.md) (GUI toolkit),
+[ADR 0004](docs/adr/0004-virtmic-native-source-node.md) (native virtual
+mic).
 
 ## Requirements
 
 Linux with PipeWire (developed and verified on CachyOS / Arch):
 
-- `pipewire`, `pipewire-pulse` (the pulse-compatible session; `pw-cat`
-  ships with the PipeWire audio utilities package, `pipewire-audio` on Arch)
+- `pipewire`, `pipewire-pulse` (the pulse-compatible session; `pw-cat`,
+  `pw-cli` and `pw-link` ship with the PipeWire audio utilities package,
+  `pipewire-audio` on Arch)
 - `gtk4`, `libadwaita` (GUI build/runtime libraries)
 - Rust toolchain via [mise](https://mise.jdx.dev) (pinned `stable` in
   `mise.toml`)
@@ -57,9 +65,9 @@ bare command, so `~/.cargo/bin` must be on your `PATH` for hotkeys to work.
    automatically at launch.
 3. In Zoom: Settings → Audio → Microphone = **Virtual_Mic**
    (Russian UI: Настройки → Звук → Микрофон). The pulse source is
-   `virtmic.monitor`; the device description Zoom shows is "Virtual_Mic".
-   If Zoom had another device selected, re-select it — Zoom caches input
-   devices.
+   `virtmic` — a real (non-monitor) source backed by the native
+   Audio/Source/Virtual node. If Zoom had another device selected,
+   re-select it — Zoom caches input devices.
 4. Click **Тест** in the GUI: a 2 s 440 Hz tone plays and the VU bar
    ("Виртуальный микрофон") reacts.
 5. Or headless: `soundboard play airhorn`, `soundboard doctor`,
@@ -91,8 +99,9 @@ keys / malformed values → error):
 | `mic_mix` | `true` | Pass the real microphone through into the virtual mic. |
 | `monitoring` | `false` | Also route clip audio to the real speakers. |
 
-Module ownership is tracked in `$XDG_STATE_HOME/soundboard/modules.json`
-(typically `~/.local/state/soundboard/modules.json`).
+Ownership is tracked in `$XDG_STATE_HOME/soundboard/modules.json`
+(schema v2: pulse module indices + native node ids, typically
+`~/.local/state/soundboard/modules.json`).
 
 ## Hotkeys
 
@@ -131,9 +140,11 @@ Verified once per release on the real desktop session:
 - **Virtual mic is silent in Zoom**: run `soundboard doctor` — fix whatever
   fails (or press «Починить граф» / run `soundboard up`), then re-select
   "Virtual_Mic" in Zoom's audio settings; Zoom caches the previously chosen
-  device.
+  device. **If Virtual_Mic is missing from Zoom's mic list entirely**:
+  run `soundboard doctor` and re-open Zoom's audio settings after the
+  graph is green (Zoom only rescans devices when its settings are reopened).
 - **No signal although the graph is green**: probe the source directly with
-  `cargo run --example vu_probe --` (defaults to `virtmic.monitor`, prints
+  `cargo run --example vu_probe --` (defaults to `virtmic`, prints
   ~10 peak levels/second, Ctrl+C to stop). Peaks while playing → capture
   side is fine, check the conferencing app. Flat → check
   `pactl list sink-inputs` while playing.
@@ -143,8 +154,10 @@ Verified once per release on the real desktop session:
   `soundboard up` once (it adopts the exact-args modules back into the
   state), then `soundboard down` works again.
 - **The graph survives app close by design** (Zoom keeps its device);
-  `soundboard down` removes it completely.
-- **Do NOT hand-roll the virtual mic** with
+  `soundboard down` removes it completely — including the native node
+  (`pw-cli destroy`; a pipewire daemon restart also removes it, `up`
+  recreates everything).
+- **Do NOT hand-roll the virtual mic** with pulse-level
   `media.class=Audio/Source/Virtual` null-sinks or `pw-loopback` — both are
   live-tested broken on PipeWire 1.6.9 (silently re-targeted to the default
   sink). Use `soundboard up`; the details are in
