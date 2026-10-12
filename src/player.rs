@@ -162,10 +162,10 @@ impl PwCatPlayer {
                         self.binary.display()
                     ));
                 }
-                return Err(anyhow::anyhow!(
-                    "failed to spawn {}: {e}",
-                    self.binary.display()
-                ));
+                // The io error stays in the chain: the test helpers classify
+                // the transient ETXTBSY by its ErrorKind.
+                return Err(e)
+                    .with_context(|| format!("failed to spawn {}", self.binary.display()));
             }
         };
         let handle = self.alloc_handle();
@@ -237,7 +237,7 @@ impl Player for PwCatPlayer {
         signal_group(pid, libc::SIGTERM);
         if !wait_exit(&mut running.child, TERM_GRACE)? {
             signal_group(pid, libc::SIGKILL);
-            signal_pid(pid, libc::SIGKILL);
+            let _ = signal_pid(pid, libc::SIGKILL); // child.wait() is the authority
             running
                 .child
                 .wait()
@@ -329,16 +329,41 @@ impl PwCatPlayer {
     /// SIGTERM→SIGKILLs every matching external playback; returns how many
     /// were stopped.
     ///
+    /// Before each signal the pid's `/proc/<pid>/cmdline` is re-read: a pid
+    /// that no longer matches is treated as gone and skipped, so a recycled
+    /// pid is never signaled. A pid that exists but refuses our signal
+    /// (`EPERM` — owned by another user) is skipped as foreign. Only genuine
+    /// failures while signaling our own pids fail the command.
+    ///
     /// # Errors
-    /// Fails when a process survives SIGKILL (or `/proc` is unreadable).
+    /// Fails when a matching process survives SIGKILL, or signaling it fails
+    /// for a reason other than EPERM/ESRCH (or `/proc` is unreadable).
     pub fn stop_external(clip: Option<&Path>) -> Result<usize> {
         let found = Self::find_running(clip)?;
         let mut stopped = 0usize;
         for playback in found {
             let pid = playback.pid;
-            signal_pid(pid, libc::SIGTERM);
+            if !cmdline_still_matches(pid, clip) {
+                continue; // exited (or pid recycled) since the scan
+            }
+            match signal_pid(pid, libc::SIGTERM) {
+                SignalOutcome::Sent | SignalOutcome::Gone => {}
+                SignalOutcome::Foreign => continue,
+                SignalOutcome::Failed(e) => {
+                    return Err(e).with_context(|| format!("failed to signal {pid}"));
+                }
+            }
             if !wait_gone(pid, TERM_GRACE) {
-                signal_pid(pid, libc::SIGKILL);
+                if !cmdline_still_matches(pid, clip) {
+                    continue; // gone mid-grace; never SIGKILL a recycled pid
+                }
+                match signal_pid(pid, libc::SIGKILL) {
+                    SignalOutcome::Sent | SignalOutcome::Gone => {}
+                    SignalOutcome::Foreign => continue,
+                    SignalOutcome::Failed(e) => {
+                        return Err(e).with_context(|| format!("failed to signal {pid}"));
+                    }
+                }
                 if !wait_gone(pid, TERM_GRACE) {
                     bail!("process {pid} refused to die");
                 }
@@ -349,8 +374,17 @@ impl PwCatPlayer {
     }
 }
 
+/// Best-effort canonical form of `path`; falls back to the raw path when
+/// canonicalization fails (missing file, dangling symlink, permission gap).
+fn best_effort_canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// True for argument lists of the shape our player spawns:
 /// `--playback` plus `--target <our sink>`, optionally restricted to one clip.
+/// The clip comparison is canonicalized on both sides (the filter may spell
+/// the clip through a symlink or non-normalized path); falls back to raw
+/// comparison when either side cannot be canonicalized.
 fn matches_cat_args(args: &[String], clip: Option<&Path>) -> bool {
     let has_playback = args.iter().any(|a| a == "--playback");
     let has_target = args
@@ -359,9 +393,51 @@ fn matches_cat_args(args: &[String], clip: Option<&Path>) -> bool {
         || args.iter().any(|a| a == &format!("--target={SINK_MEMES}"));
     let clip_matches = match clip {
         None => true,
-        Some(clip) => args.iter().any(|a| Path::new(a.as_str()) == clip),
+        Some(clip) => args.iter().any(|a| {
+            let arg = Path::new(a.as_str());
+            arg == clip || best_effort_canonical(arg) == best_effort_canonical(clip)
+        }),
     };
     has_playback && has_target && clip_matches
+}
+
+/// Outcome of trying to signal an external pid.
+#[derive(Debug)]
+enum SignalOutcome {
+    /// Signal was delivered.
+    Sent,
+    /// Process no longer exists (ESRCH).
+    Gone,
+    /// Process exists but is not ours to signal (EPERM, e.g. another user's).
+    Foreign,
+    /// Unexpected failure while signaling.
+    Failed(std::io::Error),
+}
+
+/// Pure errno→outcome mapping (unit-testable core of [`signal_pid`]).
+fn kill_outcome(res: std::io::Result<()>) -> SignalOutcome {
+    match res {
+        Ok(()) => SignalOutcome::Sent,
+        Err(e) => match e.raw_os_error() {
+            Some(libc::ESRCH) => SignalOutcome::Gone,
+            Some(libc::EPERM) => SignalOutcome::Foreign,
+            _ => SignalOutcome::Failed(e),
+        },
+    }
+}
+
+/// True while `/proc/<pid>/cmdline` still holds argument lists of our shape
+/// (see [`matches_cat_args`]); a vanished or recycled pid reads as false.
+fn cmdline_still_matches(pid: u32, clip: Option<&Path>) -> bool {
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<String> = String::from_utf8_lossy(&bytes)
+        .split('\0')
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .collect();
+    matches_cat_args(&args, clip)
 }
 
 fn signal_group(pid: u32, sig: i32) {
@@ -370,9 +446,14 @@ fn signal_group(pid: u32, sig: i32) {
     let _ = unsafe { libc::kill(-(pid as i32), sig) };
 }
 
-fn signal_pid(pid: u32, sig: i32) {
+fn signal_pid(pid: u32, sig: i32) -> SignalOutcome {
     // Safety: kill only sends a signal; it cannot dereference bad pointers.
-    let _ = unsafe { libc::kill(pid as i32, sig) };
+    let res = if unsafe { libc::kill(pid as i32, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    kill_outcome(res)
 }
 
 /// Polls `try_wait` until the child exited or `timeout` elapsed.
@@ -457,32 +538,130 @@ mod tests {
     use crate::scheduler::Scheduler;
 
     /// Writes a fake player script: logs its arguments, then `behavior`.
+    ///
+    /// The payload is written to a unique temporary sibling and atomically
+    /// renamed into place, so the file a child later `exec`s was never open
+    /// for writing — without this, parallel test load can hit a flaky
+    /// `ETXTBSY` on exec of the just-written script.
     fn fake_player(dir: &Path, behavior: &str, log: &Path) -> PathBuf {
         let script = dir.join("fake-pw-cat.sh");
-        let mut file = File::create(&script).expect("create fake script");
-        write!(
-            file,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{behavior}\n",
-            log.display()
-        )
-        .expect("write fake script");
-        drop(file);
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake script");
+        write_script_atomic(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{behavior}\n",
+                log.display()
+            ),
+        );
         script
     }
 
-    fn spawn_fake(script: &Path, args: &[&str]) -> Child {
-        Command::new(script)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn fake")
+    /// Writes `content` to `path` and makes it executable via a unique temp
+    /// file plus atomic rename (see [`fake_player`] for why).
+    fn write_script_atomic(path: &Path, content: &str) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let tmp = path.with_extension(format!("tmp-{}-{nanos}", std::process::id()));
+        let mut file = File::create(&tmp).expect("create temp script");
+        file.write_all(content.as_bytes())
+            .expect("write temp script");
+        drop(file);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod temp script");
+        std::fs::rename(&tmp, path).expect("rename script into place");
     }
 
     fn spawn_probe_window() -> Duration {
         Duration::from_millis(30)
+    }
+
+    /// Dumps every process holding `path` open (pid, cmdline, fd flags) —
+    /// diagnostics for the ETXTBSY hunt in tests.
+    fn report_file_holders(path: &Path) -> String {
+        let mut out = String::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
+            let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+                continue;
+            };
+            for fd in fds.flatten() {
+                if std::fs::read_link(fd.path()).is_ok_and(|l| l == path) {
+                    let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                        .map(|s| s.replace('\0', " "))
+                        .unwrap_or_else(|_| "?".to_string());
+                    let flags = std::fs::read_to_string(format!(
+                        "/proc/{pid}/fdinfo/{}",
+                        fd.file_name().to_string_lossy()
+                    ))
+                    .map(|s| {
+                        s.lines()
+                            .find(|l| l.starts_with("flags:"))
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                    out.push_str(&format!("\n  holder pid={pid} flags=[{flags}] cmd={cmd}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// True when `err` is the transient ETXTBSY of exec'ing a script file.
+    fn is_etxtbsy(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::ExecutableFileBusy)
+    }
+
+    /// Plays via `player`, retrying while the spawn fails with ETXTBSY.
+    ///
+    /// The atomic-rename write in [`fake_player`] shrinks the classic
+    /// exec-just-written-file race; when it still bites despite the retries,
+    /// the panic lists the /proc holders of the file for diagnosis.
+    fn play_retrying(player: &mut PwCatPlayer, clip: &Path, name: &str, volume: f32) -> Handle {
+        for attempt in 0..50u32 {
+            match player.play(clip, name, volume) {
+                Ok(handle) => return handle,
+                Err(err) if attempt < 49 && is_etxtbsy(&err) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => {
+                    let holders = report_file_holders(&player.binary);
+                    panic!("play {name} failed: {err:#}{holders}");
+                }
+            }
+        }
+        unreachable!("retry loop always returns or panics")
+    }
+
+    /// Spawns a fake script directly, retrying on the same transient ETXTBSY
+    /// window as [`play_retrying`].
+    fn spawn_fake(script: &Path, args: &[&str]) -> Child {
+        for attempt in 0..50u32 {
+            match Command::new(script)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => return child,
+                Err(e) if attempt < 49 && e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("spawn fake failed: {e}"),
+            }
+        }
+        unreachable!("retry loop always returns or panics")
     }
 
     #[test]
@@ -496,7 +675,7 @@ mod tests {
             .with_binary(script)
             .with_probe_window(spawn_probe_window());
 
-        let handle = player.play(&clip, "airhorn", 0.9).expect("play");
+        let handle = play_retrying(&mut player, &clip, "airhorn", 0.9);
         assert_eq!(player.active(), vec![(handle, "airhorn".to_string())]);
 
         let calls = std::fs::read_to_string(&log).expect("read log");
@@ -522,7 +701,7 @@ mod tests {
         let mut player = PwCatPlayer::new()
             .with_binary(script)
             .with_probe_window(spawn_probe_window());
-        let handle = player.play(&clip, "x", 1.0).expect("play");
+        let handle = play_retrying(&mut player, &clip, "x", 1.0);
         player.stop(handle).expect("stop");
         // The process group is gone: nothing matches the external scan.
         let external = PwCatPlayer::find_running(Some(&clip)).expect("find");
@@ -543,7 +722,7 @@ mod tests {
         let mut player = PwCatPlayer::new()
             .with_binary(script)
             .with_probe_window(Duration::ZERO);
-        let handle = player.play(&clip, "x", 1.0).expect("play");
+        let handle = play_retrying(&mut player, &clip, "x", 1.0);
         assert_eq!(player.active().len(), 1);
         thread::sleep(Duration::from_millis(400));
         let finished = player.reap();
@@ -565,7 +744,15 @@ mod tests {
         let mut player = PwCatPlayer::new()
             .with_binary(script)
             .with_probe_window(spawn_probe_window());
-        let err = player.play(&clip, "broken", 1.0).expect_err("decode error");
+        // Wait out the transient ETXTBSY (see play_retrying); the expected
+        // outcome is the decode failure, not a spawn failure.
+        let err = loop {
+            match player.play(&clip, "broken", 1.0) {
+                Ok(_handle) => panic!("expected decode error, got a running playback"),
+                Err(err) if is_etxtbsy(&err) => thread::sleep(Duration::from_millis(20)),
+                Err(err) => break err,
+            }
+        };
         let text = err.to_string();
         assert!(text.contains("exited immediately"), "{text}");
         assert!(text.contains("fake: unsupported format"), "{text}");
@@ -592,8 +779,8 @@ mod tests {
         let mut player = PwCatPlayer::new()
             .with_binary(script)
             .with_probe_window(spawn_probe_window());
-        let h1 = player.play(&a, "a", 1.0).expect("play a");
-        let h2 = player.play(&b, "b", 1.0).expect("play b");
+        let h1 = play_retrying(&mut player, &a, "a", 1.0);
+        let h2 = play_retrying(&mut player, &b, "b", 1.0);
         assert_eq!(player.active().len(), 2);
         player.stop_all().expect("stop all");
         assert!(player.active().is_empty());
@@ -627,13 +814,13 @@ mod tests {
 
         let d1 = press(&mut sched, "airhorn", true);
         assert_eq!(d1, crate::scheduler::Decision::Start { stop: vec![] });
-        let h1 = player.play(&airhorn, "airhorn", 1.0).expect("play 1");
+        let h1 = play_retrying(&mut player, &airhorn, "airhorn", 1.0);
         sched.started("airhorn", h1);
 
         // Different clip overlaps.
         let d2 = press(&mut sched, "applause", true);
         assert_eq!(d2, crate::scheduler::Decision::Start { stop: vec![] });
-        let h2 = player.play(&applause, "applause", 1.0).expect("play 2");
+        let h2 = play_retrying(&mut player, &applause, "applause", 1.0);
         sched.started("applause", h2);
         assert_eq!(player.active().len(), 2);
 
@@ -646,7 +833,7 @@ mod tests {
         for handle in stop {
             player.stop(handle).expect("stop old");
         }
-        let h3 = player.play(&airhorn, "airhorn", 1.0).expect("play 3");
+        let h3 = play_retrying(&mut player, &airhorn, "airhorn", 1.0);
         sched.started("airhorn", h3);
         assert_eq!(
             player.active(),
@@ -675,7 +862,7 @@ mod tests {
         let mut player = PwCatPlayer::new()
             .with_binary(script)
             .with_probe_window(spawn_probe_window());
-        let handle = player.play(&clip, "v", 2.0).expect("play");
+        let handle = play_retrying(&mut player, &clip, "v", 2.0);
         player.stop(handle).expect("stop");
         let calls = std::fs::read_to_string(&log).expect("read log");
         assert_eq!(
@@ -697,16 +884,13 @@ mod tests {
         // shape: no exec, and a TERM trap that kills its background sleep so
         // nothing is orphaned when stop_external signals the shell.
         let script = dir.path().join("fake-external.sh");
-        std::fs::write(
+        write_script_atomic(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ntrap 'kill $pid 2>/dev/null; exit 0' TERM\nsleep 30 &\npid=$!\nwait $pid\n",
                 log.display()
             ),
-        )
-        .expect("write script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod script");
+        );
         let mut child = spawn_fake(
             &script,
             &[
@@ -766,5 +950,69 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(matches_cat_args(&eq_form, None));
+    }
+
+    #[test]
+    fn clip_filter_matches_through_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link_dir = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link_dir).expect("symlink");
+        let real = dir.path().join("x.wav");
+        File::create(&real).expect("clip");
+        let args: Vec<String> = [
+            "pw-cat",
+            "--playback",
+            "--target",
+            "soundboard",
+            real.to_str().expect("utf8"),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // The filter may spell the clip through a symlinked directory.
+        assert!(
+            matches_cat_args(&args, Some(&link_dir.join("x.wav"))),
+            "symlinked filter path must match the real arg path"
+        );
+        // And the other way around: a real filter path matches a symlinked arg.
+        let linked_arg: Vec<String> = [
+            "pw-cat",
+            "--playback",
+            "--target",
+            "soundboard",
+            link_dir.join("x.wav").to_str().expect("utf8"),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(matches_cat_args(&linked_arg, Some(&real)));
+        // Unrelated clips still do not match.
+        assert!(!matches_cat_args(&args, Some(&link_dir.join("y.wav"))));
+    }
+
+    #[test]
+    fn kill_outcome_maps_errnos() {
+        assert!(matches!(kill_outcome(Ok(())), SignalOutcome::Sent));
+        assert!(matches!(
+            kill_outcome(Err(std::io::Error::from_raw_os_error(libc::ESRCH))),
+            SignalOutcome::Gone
+        ));
+        assert!(matches!(
+            kill_outcome(Err(std::io::Error::from_raw_os_error(libc::EPERM))),
+            SignalOutcome::Foreign
+        ));
+        assert!(matches!(
+            kill_outcome(Err(std::io::Error::from_raw_os_error(libc::EINVAL))),
+            SignalOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn cmdline_still_matches_rejects_missing_pids() {
+        // No live process has this pid in this namespace with our args; the
+        // helper must read it as gone rather than panicking or matching.
+        // (Linux pid_max caps far below this value by default.)
+        let absent: u32 = 4_000_000_001;
+        assert!(!cmdline_still_matches(absent, None));
     }
 }
