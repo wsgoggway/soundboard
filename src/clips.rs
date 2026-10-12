@@ -87,7 +87,9 @@ impl Clips {
                     }
                     files.push(entry.path());
                 }
-                Err(e) => clips.warnings.push(format!("не удалось получить содержимое {dir:?}: {e}")),
+                Err(e) => clips
+                    .warnings
+                    .push(format!("не удалось получить содержимое {dir:?}: {e}")),
             }
         }
         // Deterministic duplicate handling: sort by file name, first wins.
