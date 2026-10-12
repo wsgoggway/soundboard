@@ -158,14 +158,14 @@ impl PwCatPlayer {
                 remove_log_best_effort(&stderr_log);
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(anyhow::anyhow!(
-                        "player binary '{}' not found (is pipewire-utils installed?)",
+                        "бинарь плеера '{}' не найден (установлен ли pipewire-utils?)",
                         self.binary.display()
                     ));
                 }
                 // The io error stays in the chain: the test helpers classify
                 // the transient ETXTBSY by its ErrorKind.
                 return Err(e)
-                    .with_context(|| format!("failed to spawn {}", self.binary.display()));
+                    .with_context(|| format!("не удалось запустить {}", self.binary.display()));
             }
         };
         let handle = self.alloc_handle();
@@ -203,7 +203,7 @@ impl Player for PwCatPlayer {
                 Err(e) => {
                     let _ = running.child.kill();
                     let _ = running.child.wait();
-                    bail!("player probe failed: {e}");
+                    bail!("сбой опроса плеера: {e}");
                 }
             }
             thread::sleep(POLL_STEP);
@@ -213,7 +213,7 @@ impl Player for PwCatPlayer {
                 let stderr = read_first_line(&running.stderr_log);
                 remove_log_best_effort(&running.stderr_log);
                 bail!(
-                    "player exited immediately with {status}{}",
+                    "плеер завершился сразу с {status}{}",
                     stderr.map_or_else(String::new, |line| format!(": {line}"))
                 )
             }
@@ -241,7 +241,7 @@ impl Player for PwCatPlayer {
             running
                 .child
                 .wait()
-                .with_context(|| format!("failed to reap {pid} after SIGKILL"))?;
+                .with_context(|| format!("не удалось забрать {pid} после SIGKILL"))?;
         }
         remove_log_best_effort(&running.stderr_log);
         Ok(())
@@ -350,7 +350,7 @@ impl PwCatPlayer {
                 SignalOutcome::Sent | SignalOutcome::Gone => {}
                 SignalOutcome::Foreign => continue,
                 SignalOutcome::Failed(e) => {
-                    return Err(e).with_context(|| format!("failed to signal {pid}"));
+                    return Err(e).with_context(|| format!("не удалось отправить сигнал {pid}"));
                 }
             }
             if !wait_gone(pid, TERM_GRACE) {
@@ -361,11 +361,12 @@ impl PwCatPlayer {
                     SignalOutcome::Sent | SignalOutcome::Gone => {}
                     SignalOutcome::Foreign => continue,
                     SignalOutcome::Failed(e) => {
-                        return Err(e).with_context(|| format!("failed to signal {pid}"));
+                        return Err(e)
+                            .with_context(|| format!("не удалось отправить сигнал {pid}"));
                     }
                 }
                 if !wait_gone(pid, TERM_GRACE) {
-                    bail!("process {pid} refused to die");
+                    bail!("процесс {pid} не завершился");
                 }
             }
             stopped += 1;
@@ -754,7 +755,7 @@ mod tests {
             }
         };
         let text = err.to_string();
-        assert!(text.contains("exited immediately"), "{text}");
+        assert!(text.contains("завершился сразу"), "{text}");
         assert!(text.contains("fake: unsupported format"), "{text}");
         assert!(player.active().is_empty());
     }
@@ -764,7 +765,7 @@ mod tests {
         let clip = Path::new("/nonexistent/clip.wav");
         let mut player = PwCatPlayer::new().with_binary(PathBuf::from("/nonexistent/sb-pw-cat"));
         let err = player.play(clip, "x", 1.0).expect_err("not found");
-        assert!(err.to_string().contains("not found"), "{err:?}");
+        assert!(err.to_string().contains("не найден"), "{err:?}");
     }
 
     #[test]

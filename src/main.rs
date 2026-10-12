@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("ошибка: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -71,7 +71,7 @@ fn ensure_graph(cfg: &Config) -> Result<()> {
 
 fn print_clip_warnings(clips: &Clips) {
     for warning in clips.warnings() {
-        eprintln!("warning: {warning}");
+        eprintln!("предупреждение: {warning}");
     }
 }
 
@@ -83,7 +83,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Up) => {
-            let cfg = Config::load().context("failed to load config")?;
+            let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
             let report = open_graph()?.reconcile(&cfg)?;
             println!("{}", report.summary());
             Ok(ExitCode::SUCCESS)
@@ -94,7 +94,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Doctor) => {
-            let cfg = Config::load().context("failed to load config")?;
+            let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
             let report = open_graph()?.doctor(&cfg);
             println!("{}", report.render());
             Ok(if report.all_passed() {
@@ -104,11 +104,11 @@ fn run() -> Result<ExitCode> {
             })
         }
         Some(Commands::List) => {
-            let cfg = Config::load().context("failed to load config")?;
+            let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
             let clips = Clips::scan(&cfg.clips_dir);
             print_clip_warnings(&clips);
             if clips.is_empty() {
-                println!("no clips found in {}", cfg.clips_dir.display());
+                println!("клипы не найдены в {}", cfg.clips_dir.display());
             } else {
                 for name in clips.list() {
                     println!("{name}");
@@ -117,7 +117,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Play { name }) => {
-            let cfg = Config::load().context("failed to load config")?;
+            let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
             let clips = Clips::scan(&cfg.clips_dir);
             print_clip_warnings(&clips);
             let clip = clips.resolve(&name)?;
@@ -130,11 +130,11 @@ fn run() -> Result<ExitCode> {
             }
             let mut player = PwCatPlayer::new();
             player.play(clip.path, clip.name, cfg.volume)?;
-            println!("playing {}", clip.name);
+            println!("воспроизведение: {}", clip.name);
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Stop { name }) => {
-            let cfg = Config::load().context("failed to load config")?;
+            let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
             let clip_path: Option<PathBuf> = match &name {
                 Some(query) => {
                     let clips = Clips::scan(&cfg.clips_dir);
@@ -153,15 +153,17 @@ fn run() -> Result<ExitCode> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("warning: graph not reconciled, stopping anyway: {e:#}");
+                    eprintln!(
+                        "предупреждение: граф не приведён в порядок, останавливаю всё равно: {e:#}"
+                    );
                 }
             }
             let stopped = PwCatPlayer::stop_external(clip_path.as_deref())?;
             match (&name, stopped) {
-                (Some(clip_name), 0) => println!("{clip_name} is not playing"),
-                (Some(clip_name), _) => println!("stopped {clip_name}"),
-                (None, 0) => println!("nothing playing"),
-                (None, n) => println!("stopped {n}"),
+                (Some(clip_name), 0) => println!("{clip_name} не воспроизводится"),
+                (Some(clip_name), _) => println!("остановлено: {clip_name}"),
+                (None, 0) => println!("ничего не воспроизводится"),
+                (None, n) => println!("остановлено: {n}"),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -190,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn no_args_means_gui_placeholder() {
+    fn no_args_means_gui() {
         let cli = Cli::try_parse_from(["soundboard"]).expect("parse");
         assert!(cli.command.is_none());
     }

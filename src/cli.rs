@@ -1,14 +1,15 @@
 //! Clap definitions for the soundboard command-line interface.
+//! Help texts shown to the user are in Russian; identifiers stay English.
 
 use clap::Parser;
 use clap::Subcommand;
 
-/// Soundboard: plays short meme audio clips into a PipeWire virtual microphone
-/// for use in Zoom and other conferencing apps on Linux.
+/// Soundboard: воспроизводит короткие аудиоклипы в виртуальный микрофон
+/// PipeWire для Zoom и других конференций в Linux.
 #[derive(Parser, Debug)]
 #[command(name = "soundboard", version, about, long_about = None)]
 pub struct Cli {
-    /// Subcommand to run; none means the GUI (not implemented yet).
+    /// Подкоманда; без неё запускается графический интерфейс.
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -16,22 +17,22 @@ pub struct Cli {
 /// Available subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Create or repair the audio graph (idempotent desired-state reconcile).
+    /// Создать или починить аудиограф (идемпотентный reconcile).
     Up,
-    /// Tear down soundboard's audio modules (foreign modules survive).
+    /// Выгрузить модули soundboard (чужие модули не трогаются).
     Down,
-    /// Verify the audio graph state; exit code 1 when problems are found.
+    /// Проверить состояние аудиографа; код 1 — если найдены проблемы.
     Doctor,
-    /// List clips found in the configured clips directory.
+    /// Показать клипы из настроенного каталога клипов.
     List,
-    /// Start playing a clip (non-blocking; auto-reconciles the graph first).
+    /// Проиграть клип (неблокирующе; граф поднимается автоматически).
     Play {
-        /// Clip name: exact, unique case-insensitive or unique prefix.
+        /// Имя клипа: точное, уникальное без учёта регистра или уникальный префикс.
         name: String,
     },
-    /// Stop playing; without NAME stops everything (auto-reconciles first).
+    /// Остановить воспроизведение; без ИМЕНИ — всё (граф поднимается сначала).
     Stop {
-        /// Clip name to stop; omit to stop all playbacks.
+        /// Имя клипа; опустите, чтобы остановить всё.
         name: Option<String>,
     },
 }

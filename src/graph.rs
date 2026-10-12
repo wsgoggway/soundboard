@@ -68,8 +68,9 @@ pub const SINK_VIRTMIC: &str = "virtmic";
 /// Contract constant; reserved for the UI (M3) and doctor output.
 #[allow(dead_code)]
 pub const SOURCE_VIRTMIC_MONITOR: &str = "virtmic.monitor";
-/// Human-readable hint appended to `doctor` output.
-pub const ZOOM_HINT: &str = "Zoom: Settings \u{2192} Audio \u{2192} Microphone = \"Virtual_Mic\"";
+/// Human-readable hint appended to `doctor` output (Russian for the user;
+/// node names stay as the server reports them).
+pub const ZOOM_HINT: &str = "Zoom: Настройки \u{2192} Звук \u{2192} Микрофон = \"Virtual_Mic\"";
 
 const MODULE_NULL_SINK: &str = "module-null-sink";
 const MODULE_LOOPBACK: &str = "module-loopback";
@@ -245,12 +246,14 @@ impl ModuleState {
     /// a persisted registry the next `down` cannot find our modules).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create state dir {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("не удалось создать каталог состояния {}", parent.display())
+            })?;
         }
         let text =
             serde_json::to_string_pretty(self).context("failed to serialize module state")?;
-        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+        std::fs::write(path, text)
+            .with_context(|| format!("не удалось записать {}", path.display()))
     }
 }
 
@@ -262,7 +265,9 @@ impl ModuleState {
 /// Fails when the XDG state directory cannot be determined.
 pub fn default_state_path() -> anyhow::Result<PathBuf> {
     let dir = dirs::state_dir().ok_or_else(|| {
-        anyhow::anyhow!("cannot determine the XDG state directory (set XDG_STATE_HOME or HOME)")
+        anyhow::anyhow!(
+            "не удалось определить каталог состояния XDG (задайте XDG_STATE_HOME или HOME)"
+        )
     })?;
     Ok(dir.join("soundboard").join("modules.json"))
 }
@@ -310,26 +315,26 @@ impl Report {
         self.changes.is_empty() && self.warnings.is_empty()
     }
 
-    /// Human-readable multi-line summary ("no changes" when noop).
+    /// Human-readable multi-line summary ("изменений нет" when noop).
     #[must_use]
     pub fn summary(&self) -> String {
         if self.is_noop() {
-            return "no changes".to_string();
+            return "изменений нет".to_string();
         }
         let mut lines = Vec::new();
         for c in &self.changes {
             let verb = match c.action {
-                ChangeAction::Load => "loaded",
-                ChangeAction::Unload => "unloaded",
-                ChangeAction::Reload => "reloaded",
+                ChangeAction::Load => "загружен",
+                ChangeAction::Unload => "выгружен",
+                ChangeAction::Reload => "перезагружен",
             };
             let index = c
                 .index
-                .map_or_else(String::new, |i| format!(" (index {i})"));
-            lines.push(format!("{} {} [{}]{}", verb, c.module, c.slot, index));
+                .map_or_else(String::new, |i| format!(" (индекс {i})"));
+            lines.push(format!("{verb} {} [{}]{}", c.module, c.slot, index));
         }
         for w in &self.warnings {
-            lines.push(format!("warning: {w}"));
+            lines.push(format!("предупреждение: {w}"));
         }
         lines.join("\n")
     }
@@ -388,7 +393,7 @@ fn desired_state(
                 args: format!("source={mic} sink={SINK_VIRTMIC}"),
             }),
             None => warnings.push(
-                "mic_mix is enabled but no real microphone found (default source is unset or a monitor); mic-mix loopback skipped".to_string(),
+                "mic_mix включён, но реальный микрофон не найден (источник по умолчанию не задан или монитор); mic-mix loopback пропущен".to_string(),
             ),
         }
     }
@@ -400,7 +405,7 @@ fn desired_state(
                 args: format!("source={SOURCE_MEMES_MONITOR} sink={sink}"),
             }),
             None => warnings.push(
-                "monitoring is enabled but no default sink found; monitoring loopback skipped"
+                "monitoring включён, но синк по умолчанию не найден; monitoring loopback пропущен"
                     .to_string(),
             ),
         }
@@ -437,16 +442,19 @@ fn foreign_warning(m: &ModuleInfo) -> String {
     let kv = args_kv(&m.args);
     if m.name == MODULE_LOOPBACK {
         if kv.get("sink").map(String::as_str) == Some(SINK_VIRTMIC) {
-            return format!("foreign loopback on {SINK_VIRTMIC} left alone: {}", m.args);
+            return format!(
+                "чужой loopback на {SINK_VIRTMIC} оставлен без изменений: {}",
+                m.args
+            );
         }
         if kv.get("source").map(String::as_str) == Some(SOURCE_MEMES_MONITOR) {
             return format!(
-                "foreign loopback from {SOURCE_MEMES_MONITOR} left alone: {}",
+                "чужой loopback от {SOURCE_MEMES_MONITOR} оставлен без изменений: {}",
                 m.args
             );
         }
     }
-    format!("foreign {} left alone: {}", m.name, m.args)
+    format!("чужой {} оставлен без изменений: {}", m.name, m.args)
 }
 
 /// Applies the desired state: loads missing modules, unloads+reloads the ones
@@ -617,7 +625,7 @@ impl DoctorReport {
             .checks
             .iter()
             .map(|c| {
-                let status = if c.passed { "PASS" } else { "FAIL" };
+                let status = if c.passed { "УСПЕХ" } else { "СБОЙ" };
                 let detail = if c.detail.is_empty() {
                     String::new()
                 } else {
@@ -626,11 +634,11 @@ impl DoctorReport {
                 format!("[{status}] {}{detail}", c.name)
             })
             .collect();
-        lines.push(format!("Hint: {ZOOM_HINT}"));
+        lines.push(format!("Подсказка: {ZOOM_HINT}"));
         lines.push(if self.all_passed() {
-            "all checks passed".to_string()
+            "все проверки пройдены".to_string()
         } else {
-            "PROBLEMS FOUND".to_string()
+            "ОБНАРУЖЕНЫ ПРОБЛЕМЫ".to_string()
         });
         lines.join("\n")
     }
@@ -646,7 +654,11 @@ fn check(name: &str, passed: bool, detail: String) -> Check {
 
 /// Skipped filler for the checks that depend on a reachable server.
 fn skipped(name: &str) -> Check {
-    check(name, false, "skipped: pulse server unreachable".to_string())
+    check(
+        name,
+        false,
+        "пропущено: pulse-сервер недоступен".to_string(),
+    )
 }
 
 /// Checks that exactly one slot entry exists and its args match the desired
@@ -668,26 +680,26 @@ fn slot_check(
         Some(found) => check(
             name,
             false,
-            format!("present with unexpected args: {}", found[0].args),
+            format!("присутствует с неожидаемыми аргументами: {}", found[0].args),
         ),
-        None => check(name, false, "not found".to_string()),
+        None => check(name, false, "не найден".to_string()),
     }
 }
 
 /// Diagnoses the graph state; never fails — problems land in the report.
 pub fn doctor_with(backend: &mut dyn PulseBackend, cfg: &Config) -> DoctorReport {
-    const NAMES_SERVER: &str = "pulse server reachable";
-    const NAMES_SINK_MEMES: &str = "sink 'soundboard' present";
-    const NAMES_SINK_VIRTMIC: &str = "sink 'virtmic' present";
-    const NAMES_LOOPBACK_MEMES: &str = "loopback soundboard.monitor->virtmic present";
-    const NAMES_LOOPBACK_MIC: &str = "mic-mix loopback real-mic->virtmic present";
+    const NAMES_SERVER: &str = "pulse-сервер доступен";
+    const NAMES_SINK_MEMES: &str = "синк soundboard присутствует";
+    const NAMES_SINK_VIRTMIC: &str = "синк virtmic присутствует";
+    const NAMES_LOOPBACK_MEMES: &str = "loopback soundboard.monitor->virtmic присутствует";
+    const NAMES_LOOPBACK_MIC: &str = "mic-mix loopback real-mic->virtmic присутствует";
     const NAMES_LOOPBACK_MONITOR: &str =
-        "monitoring loopback soundboard.monitor->real-sink present";
-    const NAMES_REAL_MIC: &str = "real microphone found";
+        "monitoring loopback soundboard.monitor->real-sink присутствует";
+    const NAMES_REAL_MIC: &str = "реальный микрофон найден";
 
     let modules = match backend.modules() {
         Err(e) => {
-            let mut checks = vec![check(NAMES_SERVER, false, format!("error: {e:#}"))];
+            let mut checks = vec![check(NAMES_SERVER, false, format!("ошибка: {e:#}"))];
             checks.push(skipped(NAMES_SINK_MEMES));
             checks.push(skipped(NAMES_SINK_VIRTMIC));
             checks.push(skipped(NAMES_LOOPBACK_MEMES));
@@ -703,7 +715,7 @@ pub fn doctor_with(backend: &mut dyn PulseBackend, cfg: &Config) -> DoctorReport
         Ok(modules) => modules,
     };
 
-    let mut checks = vec![check(NAMES_SERVER, true, "server responded".to_string())];
+    let mut checks = vec![check(NAMES_SERVER, true, "сервер ответил".to_string())];
     let mut ours_by_slot: BTreeMap<Slot, Vec<ModuleInfo>> = BTreeMap::new();
     for module in modules {
         if let Some(slot) = classify(&module) {
@@ -735,14 +747,14 @@ pub fn doctor_with(backend: &mut dyn PulseBackend, cfg: &Config) -> DoctorReport
         Ok(Some(mic)) => checks.push(check(
             NAMES_REAL_MIC,
             true,
-            format!("default source: {mic}"),
+            format!("источник по умолчанию: {mic}"),
         )),
         Ok(None) => checks.push(check(
             NAMES_REAL_MIC,
             false,
-            "default source is unset or a monitor".to_string(),
+            "источник по умолчанию не задан или является монитором".to_string(),
         )),
-        Err(e) => checks.push(check(NAMES_REAL_MIC, false, format!("error: {e:#}"))),
+        Err(e) => checks.push(check(NAMES_REAL_MIC, false, format!("ошибка: {e:#}"))),
     }
 
     if cfg.mic_mix {
@@ -755,7 +767,7 @@ pub fn doctor_with(backend: &mut dyn PulseBackend, cfg: &Config) -> DoctorReport
         checks.push(match found {
             Some(m) => check(NAMES_LOOPBACK_MIC, true, m.args.clone()),
             None if matches!(&real_mic_state, Ok(Some(_))) => {
-                check(NAMES_LOOPBACK_MIC, false, "not found".to_string())
+                check(NAMES_LOOPBACK_MIC, false, "не найден".to_string())
             }
             _ => skipped(NAMES_LOOPBACK_MIC),
         });
@@ -776,19 +788,19 @@ pub fn doctor_with(backend: &mut dyn PulseBackend, cfg: &Config) -> DoctorReport
                     check(
                         NAMES_LOOPBACK_MONITOR,
                         false,
-                        format!("not found (default sink: {sink})"),
+                        format!("не найден (синк по умолчанию: {sink})"),
                     )
                 });
             }
             Ok(None) => checks.push(check(
                 NAMES_LOOPBACK_MONITOR,
                 false,
-                "no default sink".to_string(),
+                "нет синка по умолчанию".to_string(),
             )),
             Err(e) => checks.push(check(
                 NAMES_LOOPBACK_MONITOR,
                 false,
-                format!("error: {e:#}"),
+                format!("ошибка: {e:#}"),
             )),
         }
     }
@@ -852,12 +864,12 @@ fn wait_op<C: ?Sized>(
     loop {
         match mainloop.iterate(true) {
             IterateResult::Success(_) => {}
-            IterateResult::Quit(_) => bail!("pulse mainloop quit unexpectedly"),
-            IterateResult::Err(e) => bail!("pulse mainloop error: {e}"),
+            IterateResult::Quit(_) => bail!("pulse-мэйнлуп неожиданно завершился"),
+            IterateResult::Err(e) => bail!("ошибка pulse-мэйнлупа: {e}"),
         }
         match context.get_state() {
-            ContextState::Failed => bail!("pulse connection failed"),
-            ContextState::Terminated => bail!("pulse connection terminated"),
+            ContextState::Failed => bail!("pulse-соединение потеряно"),
+            ContextState::Terminated => bail!("pulse-соединение завершено"),
             _ => {}
         }
         if op.get_state() != operation::State::Running {
@@ -869,7 +881,7 @@ fn wait_op<C: ?Sized>(
 fn take_result<T>(cell: &Rc<RefCell<Option<T>>>, what: &str) -> anyhow::Result<T> {
     cell.borrow_mut()
         .take()
-        .ok_or_else(|| anyhow::anyhow!("pulse server gave no result for {what}"))
+        .ok_or_else(|| anyhow::anyhow!("pulse-сервер не дал результат для {what}"))
 }
 
 /// Real backend over the PulseAudio (PipeWire) pulse-compatible interface.
@@ -888,17 +900,17 @@ impl PulseSession {
             Context::new(&mainloop, app_name).context("failed to create pulse context")?;
         context
             .connect(None, FlagSet::NOFLAGS, None)
-            .map_err(|e| anyhow::anyhow!("failed to initiate pulse connection: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("не удалось начать pulse-соединение: {e}"))?;
         loop {
             match mainloop.iterate(true) {
                 IterateResult::Success(_) => {}
-                IterateResult::Quit(_) => bail!("pulse mainloop quit while connecting"),
-                IterateResult::Err(e) => bail!("pulse mainloop error while connecting: {e}"),
+                IterateResult::Quit(_) => bail!("pulse-мэйнлуп завершился при подключении"),
+                IterateResult::Err(e) => bail!("ошибка pulse-мэйнлупа при подключении: {e}"),
             }
             match context.get_state() {
                 ContextState::Ready => return Ok(PulseSession { context, mainloop }),
                 ContextState::Failed | ContextState::Terminated => {
-                    bail!("failed to connect to the pulse server (is pipewire-pulse running?)")
+                    bail!("не удалось подключиться к pulse-серверу (запущен ли pipewire-pulse?)")
                 }
                 _ => {}
             }
@@ -935,7 +947,7 @@ impl PulseBackend for PulseSession {
             });
         wait_op(&mut self.mainloop, &self.context, &op)?;
         if *failed.borrow() {
-            bail!("pulse server failed to list modules");
+            bail!("pulse-сервер не смог перечислить модули");
         }
         Ok(std::mem::take(&mut *out.borrow_mut()))
     }
@@ -949,7 +961,7 @@ impl PulseBackend for PulseSession {
         });
         self.run_op(&op)?;
         match take_result(&out, "load_module")? {
-            def::INVALID_INDEX => bail!("pulse server refused to load {name}"),
+            def::INVALID_INDEX => bail!("pulse-сервер отказался загружать {name}"),
             index => Ok(index),
         }
     }
@@ -964,7 +976,7 @@ impl PulseBackend for PulseSession {
         self.run_op(&op)?;
         match take_result(&out, "unload_module")? {
             true => Ok(()),
-            false => bail!("pulse server refused to unload module #{index}"),
+            false => bail!("pulse-сервер отказался выгружать модуль #{index}"),
         }
     }
 
@@ -1034,14 +1046,14 @@ mod tests {
     impl PulseBackend for MockBackend {
         fn modules(&mut self) -> anyhow::Result<Vec<ModuleInfo>> {
             if self.unreachable {
-                bail!("connection refused");
+                bail!("в соединении отказано");
             }
             Ok(self.modules.clone())
         }
 
         fn load(&mut self, name: &str, args: &str) -> anyhow::Result<u32> {
             if self.unreachable {
-                bail!("connection refused");
+                bail!("в соединении отказано");
             }
             let index = self.next_index;
             self.next_index += 1;
@@ -1055,7 +1067,7 @@ mod tests {
 
         fn unload(&mut self, index: u32) -> anyhow::Result<()> {
             if self.unreachable {
-                bail!("connection refused");
+                bail!("в соединении отказано");
             }
             self.modules.retain(|m| m.index != index);
             Ok(())
@@ -1351,7 +1363,8 @@ mod tests {
             reconcile_with(&mut backend, &passthroughs_off(), &ours).expect("reconcile");
         assert!(
             up_report.warnings.iter().any(|w| {
-                w.starts_with("foreign loopback on virtmic left alone") && w.contains(&lookalike)
+                w.starts_with("чужой loopback на virtmic оставлен без изменений")
+                    && w.contains(&lookalike)
             }),
             "expected a foreign-loopback warning, got: {up_report:?}"
         );
@@ -1538,12 +1551,12 @@ mod tests {
         let cfg = passthroughs_off();
         let report = doctor_with(&mut backend, &cfg);
         assert!(!report.all_passed());
-        assert!(report.checks[0].name.contains("server"));
+        assert!(report.checks[0].name.contains("сервер"));
         assert!(!report.checks[0].passed);
         assert!(
             report.checks[1..]
                 .iter()
-                .all(|c| !c.passed && c.detail.contains("skipped"))
+                .all(|c| !c.passed && c.detail.contains("пропущено"))
         );
     }
 

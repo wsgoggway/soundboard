@@ -98,7 +98,9 @@ pub fn config_path() -> Result<PathBuf> {
 /// environment.
 fn config_path_in(config_dir: Option<&Path>) -> Result<PathBuf> {
     let dir = config_dir.ok_or_else(|| {
-        anyhow::anyhow!("cannot determine the config directory (set XDG_CONFIG_HOME or HOME)")
+        anyhow::anyhow!(
+            "не удалось определить каталог конфигурации (задайте XDG_CONFIG_HOME или HOME)"
+        )
     })?;
     Ok(dir.join("soundboard").join("config.toml"))
 }
@@ -117,14 +119,14 @@ impl Config {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => {
-                return Err(e).with_context(|| format!("failed to read {}", path.display()));
+                return Err(e).with_context(|| format!("не удалось прочитать {}", path.display()));
             }
         };
         let mut cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("malformed config file {}", path.display()))?;
+            .with_context(|| format!("некорректный файл конфигурации {}", path.display()))?;
         if !cfg.volume.is_finite() {
             anyhow::bail!(
-                "malformed config file {}: volume must be a finite number, got {}",
+                "некорректный файл конфигурации {}: volume должен быть конечным числом, получено {}",
                 path.display(),
                 cfg.volume
             );
@@ -146,10 +148,11 @@ impl Config {
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+                .with_context(|| format!("не удалось создать {}", parent.display()))?;
         }
-        let text = toml::to_string_pretty(self).context("failed to serialize config")?;
-        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+        let text = toml::to_string_pretty(self).context("не удалось сериализовать конфигурацию")?;
+        std::fs::write(path, text)
+            .with_context(|| format!("не удалось записать {}", path.display()))
     }
 }
 
@@ -268,6 +271,6 @@ mod tests {
     #[test]
     fn config_path_errors_without_base_dir() {
         let err = config_path_in(None).expect_err("must not fall back to CWD");
-        assert!(err.to_string().contains("config directory"), "{err}");
+        assert!(err.to_string().contains("каталог конфигурации"), "{err}");
     }
 }
