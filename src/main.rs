@@ -16,6 +16,7 @@ mod cli;
 mod clips;
 mod config;
 mod graph;
+mod hotkeys;
 mod meter;
 mod player;
 mod scheduler;
@@ -133,6 +134,52 @@ fn run() -> Result<ExitCode> {
             println!("воспроизведение: {}", clip.name);
             Ok(ExitCode::SUCCESS)
         }
+        Some(Commands::Hotkeys { write }) => {
+            let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
+            let clips = Clips::scan(&cfg.clips_dir);
+            print_clip_warnings(&clips);
+            let names = clips.list();
+            let entries = hotkeys::assign_keys(&names);
+            print!(
+                "{}",
+                hotkeys::render_table(&entries, names.len().saturating_sub(entries.len()))
+            );
+            if !write {
+                print!("{}", hotkeys::render_manual_steps());
+                return Ok(ExitCode::SUCCESS);
+            }
+            if entries.is_empty() {
+                eprintln!("записывать нечего: клипы не найдены");
+                return Ok(ExitCode::FAILURE);
+            }
+            let dir = dirs::data_dir()
+                .context("не удалось определить каталог данных (XDG_DATA_HOME или HOME)")?
+                .join("applications");
+            let files = hotkeys::build_files(&entries);
+            let outcome = hotkeys::write_desktop_files(&dir, &files)?;
+            for name in &outcome.created {
+                println!("создано: {name}");
+            }
+            for name in &outcome.updated {
+                println!("обновлено: {name}");
+            }
+            for name in &outcome.unchanged {
+                println!("без изменений: {name}");
+            }
+            for name in &outcome.backups {
+                println!("резервная копия: {name}");
+            }
+            for reason in &outcome.skipped {
+                eprintln!("пропущено: {reason}");
+            }
+            println!(
+                "Активация: выполните `kbuildsycoca6`; если клавиши не появились — перелогиньтесь."
+            );
+            println!(
+                "Проверка: Параметры системы → Клавиатура → Комбинации клавиш → раздел «Команды»."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Commands::Stop { name }) => {
             let cfg = Config::load().context("не удалось загрузить конфигурацию")?;
             let clip_path: Option<PathBuf> = match &name {
@@ -230,5 +277,20 @@ mod tests {
     #[test]
     fn play_without_name_is_rejected() {
         assert!(Cli::try_parse_from(["soundboard", "play"]).is_err());
+    }
+
+    #[test]
+    fn hotkeys_parse_with_and_without_write() {
+        let plain = Cli::try_parse_from(["soundboard", "hotkeys"]).expect("parse hotkeys");
+        assert!(matches!(
+            plain.command,
+            Some(Commands::Hotkeys { write: false })
+        ));
+        let write =
+            Cli::try_parse_from(["soundboard", "hotkeys", "--write"]).expect("parse --write");
+        assert!(matches!(
+            write.command,
+            Some(Commands::Hotkeys { write: true })
+        ));
     }
 }

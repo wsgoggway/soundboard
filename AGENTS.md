@@ -8,11 +8,18 @@ microphone and plays short meme audio clips into it.
 - Rust (stable via mise; currently rustc 1.97.0 — mise's `rust` is a symlink
   backend to the rustup toolchain in `~/.cargo/bin`, pinned as `stable` in
   `mise.toml`).
-- CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`;
+- CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`/
+  `hotkeys`;
   graph reconcile over the PulseAudio/PipeWire session via
   `libpulse-binding`; playback via a `pw-cat` subprocess (`PwCatPlayer`,
   cross-process stop through `/proc`); clips registry + per-clip-interrupt
   scheduler.
+- KDE hotkeys (M4): `src/hotkeys.rs` — `soundboard hotkeys` prints a Russian
+  clip → `Alt+N` → command table + manual Plasma 6 steps; `--write` generates
+  `~/.local/share/applications/net.local.soundboard.<slug>.desktop` files
+  (`X-KDE-Shortcuts=Alt+N`, generator marker, timestamped backups, never
+  touches foreign files or `kglobalshortcutsrc`). Design + sources:
+  `docs/kde-hotkeys.md`.
 - Module ownership state: `$XDG_STATE_HOME/soundboard/modules.json` records
   the indices we loaded (see `src/graph.rs`); foreign modules are never
   touched.
@@ -52,6 +59,7 @@ Toolchains come via mise only; never install system packages.
 
 - `src/main.rs` — entry point (clap parse, app bootstrap)
 - `src/cli.rs` — clap definitions
+- `src/hotkeys.rs` — KDE Plasma hotkey table + `.desktop` generation (M4)
 - `src/config.rs` — config load (~/.config/soundboard/config.toml)
 - `src/graph.rs` — PipeWire graph management (null-sink, virtual mic, loopbacks) plus module-ownership state
 - `src/player.rs` — clip playback (pw-cat subprocess in v1)
@@ -65,6 +73,8 @@ Toolchains come via mise only; never install system packages.
 
 - `docs/pipewire-recipe.md` — CONTRACT for M1: the live-verified PipeWire
   module recipe (exact commands, node names, teardown).
+- `docs/kde-hotkeys.md` — CONTRACT for M4: how Plasma 6 registers command
+  shortcuts (research findings, sources, the `--write` design).
 - `docs/adr/` — architecture decision records.
 - `docs/hld.md` — high-level design (Mermaid), keep in sync with code.
 
