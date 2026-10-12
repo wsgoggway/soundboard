@@ -389,6 +389,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "libpulse-binding",
  "serde",
  "tempfile",
