@@ -146,6 +146,19 @@ pub fn build_files(entries: &[HotkeyEntry]) -> Vec<HotkeyFile> {
         .collect()
 }
 
+/// Sanitizes a clip name for the desktop file `Name=` value: control
+/// characters (newline, tab, CR and the rest of C0/C1) are replaced with `-`,
+/// so a hostile file stem can never close the `Name` value early and inject
+/// extra desktop-file keys (a second `Exec=`, etc.). Display-only choice:
+/// `-` keeps names readable; `Exec=` keeps its own escaping
+/// ([`escape_exec_arg`]).
+#[must_use]
+fn sanitize_display_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '-' } else { c })
+        .collect()
+}
+
 /// Renders the desktop file content for one clip+key (pure, deterministic).
 #[must_use]
 fn render_desktop_file(clip: &str, key: &str) -> String {
@@ -153,12 +166,13 @@ fn render_desktop_file(clip: &str, key: &str) -> String {
         "{GENERATOR_MARKER}\n\
          [Desktop Entry]\n\
          Type=Application\n\
-         Name=Soundboard: {clip}\n\
+         Name=Soundboard: {}\n\
          Exec=soundboard play {}\n\
          NoDisplay=true\n\
          StartupNotify=false\n\
          X-KDE-GlobalAccel-CommandShortcut=true\n\
          X-KDE-Shortcuts={key}\n",
+        sanitize_display_name(clip),
         escape_exec_arg(clip)
     )
 }
@@ -387,6 +401,44 @@ mod tests {
         assert!(a.contains("X-KDE-Shortcuts=Alt+1\n"));
         assert!(a.contains("X-KDE-GlobalAccel-CommandShortcut=true\n"));
         assert!(a.contains("NoDisplay=true\n"));
+    }
+
+    #[test]
+    fn display_name_control_chars_become_dashes() {
+        assert_eq!(sanitize_display_name("a\nb\tc\rd"), "a-b-c-d");
+        assert_eq!(sanitize_display_name("bell\u{7f}esc\u{1}"), "bell-esc-");
+        assert_eq!(sanitize_display_name("кот-обормот"), "кот-обормот");
+        assert_eq!(sanitize_display_name(""), "");
+    }
+
+    #[test]
+    fn desktop_file_name_cannot_inject_keys() {
+        let hostile = "x\nExec=xterm\n";
+        let content = render_desktop_file(hostile, "Alt+1");
+        // Exactly one Exec= line — the real one, with the hostile stem
+        // safely escaped into a single quoted argument.
+        let exec_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| line.starts_with("Exec="))
+            .collect();
+        assert_eq!(
+            exec_lines,
+            vec!["Exec=soundboard play \"x\\nExec=xterm\\n\""]
+        );
+        assert!(!content.lines().any(|line| line.starts_with("Exec=xterm")));
+        // The hostile text survives only inside the single-line Name value,
+        // with the newlines replaced by dashes.
+        assert!(content.contains("Name=Soundboard: x-Exec=xterm-\n"));
+        // Tabs and other control chars cannot split keys either.
+        assert!(render_desktop_file("a\tb", "Alt+1").contains("Name=Soundboard: a-b\n"));
+        let ctrl = render_desktop_file("p\u{1}q", "Alt+2");
+        assert!(ctrl.contains("Name=Soundboard: p-q\n"));
+        assert_eq!(
+            ctrl.lines()
+                .filter(|line| line.starts_with("X-KDE-Shortcuts="))
+                .count(),
+            1
+        );
     }
 
     #[test]
