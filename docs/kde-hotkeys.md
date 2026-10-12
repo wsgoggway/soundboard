@@ -1,83 +1,84 @@
-# KDE Plasma global shortcuts: how user-defined command hotkeys work (M4 research)
+# Глобальные хоткеи KDE Plasma: как работают пользовательские командные хоткеи (исследование M4)
 
-Researched 2026-10-12 against the live host: CachyOS, **Plasma 6.7.5**
-(`plasmashell 6.7.5`, `kwin 6.7.5`), Wayland session. All statements below are
-verified against the KDE sources (GitHub mirrors of invent.kde.org) and the
-local D-Bus interface XMLs, not guessed.
+Исследовано 2026-10-12 на живом хосте: CachyOS, **Plasma 6.7.5**
+(`plasmashell 6.7.5`, `kwin 6.7.5`), сессия Wayland. Все утверждения ниже
+проверены по исходникам KDE (GitHub-зеркала invent.kde.org) и локальным
+D-Bus-интерфейсам, не угаданы.
 
-## Where shortcuts live
+## Где живут хоткеи
 
-- **`~/.config/kglobalshortcutsrc`** — the shortcut registry (KConfig INI).
-  One section per "component". Components are either application/action
-  groups (e.g. `[kmix]`) or **service components**: sections named
-  `[services][<desktop-file-storage-id>]`.
-- In the modern format each service action is a single key with the *current*
-  shortcut only, e.g. `_launch=Alt+1` (multiple keys joined by `\t`).
-  The old `current,default,friendly-name` triplet format only survives in
-  legacy top-level groups and is migrated away by the daemon
+- **`~/.config/kglobalshortcutsrc`** — реестр хоткеев (KConfig INI). Один
+  раздел на «компонент». Компоненты — это либо группы приложений/действий
+  (например `[kmix]`), либо **сервисные компоненты**: разделы с именами
+  `[services][<storage-id desktop-файла>]`.
+- В современном формате каждое действие сервиса — один ключ, хранящий
+  только *текущий* хоткей, например `_launch=Alt+1` (несколько клавиш
+  соединяются `\t`). Старый формат-тройка `current,default,имя` доживает
+  только в легаси-группах верхнего уровня и мигрируется демоном
   (`GlobalShortcutsRegistry::migrateConfig`).
-- Override semantics: an entry is written **only when the current shortcut
-  differs from the default**. The default comes from the `.desktop` file's
-  `X-KDE-Shortcuts` entry (`KServiceActionComponent::loadSettings`:
+- Семантика переопределения: запись пишется **только когда текущий хоткей
+  отличается от дефолтного**. Дефолт берётся из записи `X-KDE-Shortcuts`
+  в `.desktop`-файле (`KServiceActionComponent::loadSettings`:
   `configGroup.readEntry("_launch", defaultFromDesktopFile)`).
 
-## How a "Command" shortcut executes
+## Как исполняется командный хоткей
 
-For service components the daemon does not signal a running app — it launches
-the desktop file itself:
-`KServiceActionComponent::emitGlobalShortcutEvent` creates a
-`KIO::ApplicationLauncherJob(m_service)` for the `_launch` action. So the
-`Exec` line of the desktop file is what runs on keypress.
+Для сервисных компонентов демон не сигналит запущенному приложению — он
+сам запускает desktop-файл: `KServiceActionComponent::emitGlobalShortcutEvent`
+создаёт `KIO::ApplicationLauncherJob(m_service)` для действия `_launch`.
+Значит, по нажатию клавиши исполняется строка `Exec` desktop-файла.
 
-## Where the daemon finds command desktop files
+## Где демон находит командные desktop-файлы
 
-Two discovery paths (`GlobalShortcutsRegistry::loadSettings` /
+Два пути обнаружения (`GlobalShortcutsRegistry::loadSettings` /
 `refreshServices` / `detectAppsWithShortcuts`):
 
-1. **`<XDG data dirs>/kglobalaccel/*.desktop`** — parsed into service
-   components **only at daemon startup**. Files with `NoDisplay=true` are
-   skipped. `refreshServices` only prunes dead entries from this path, it
-   never adds new ones at runtime.
-2. **Applications with an `X-KDE-Shortcuts` property** — found through
-   `KApplicationTrader::query` (ksycoca database, which includes
-   `~/.local/share/applications/`), refreshed whenever ksycoca signals
-   `databaseChanged` (the daemon connects `KSycoca::databaseChanged` →
-   `refreshServices`). `KApplicationTrader::query` filters only
-   `OnlyShowIn`/`NotShowIn` (`showInCurrentDesktop`); **`NoDisplay=true` does
-   not exclude a service**. Path (2) therefore supports live pickup after a
-   `kbuildsycoca6` run, no re-login needed.
+1. **`<XDG data dirs>/kglobalaccel/*.desktop`** — разбираются в сервисные
+   компоненты **только при старте демона**. Файлы с `NoDisplay=true`
+   пропускаются. `refreshServices` по этому пути только подчищает
+   мёртвые записи, новых в рантайме не добавляет.
+2. **Приложения со свойством `X-KDE-Shortcuts`** — находятся через
+   `KApplicationTrader::query` (база ksycoca, включающая
+   `~/.local/share/applications/`), обновляются каждый раз, когда ksycoca
+   сигналит `databaseChanged` (демон подключает `KSycoca::databaseChanged`
+   → `refreshServices`). `KApplicationTrader::query` фильтрует только
+   `OnlyShowIn`/`NotShowIn` (`showInCurrentDesktop`); **`NoDisplay=true`
+   сервис не исключает**. Путь (2) поэтому поддерживает живой подхват
+   после `kbuildsycoca6`, без перелогина.
 
-## What System Settings itself does (Add New → Command or Script)
+## Что делает сам Параметры системы (Добавить → Команда или сценарий)
 
-`KCMKeys::addCommand` in `plasma-desktop/kcms/keys/kcm_keys.cpp`:
+`KCMKeys::addCommand` в `plasma-desktop/kcms/keys/kcm_keys.cpp`:
 
-- writes `~/.local/share/applications/net.local.<executable>...desktop` with:
-  `Type=Application`, `Name`, `Exec` (with `%` escaped as `%%`),
+- пишет
+  `~/.local/share/applications/net.local.<executable>...desktop` с
+  `Type=Application`, `Name`, `Exec` (`%` экранируется в `%%`),
   `NoDisplay=true`, `StartupNotify=false`,
   `X-KDE-GlobalAccel-CommandShortcut=true`;
-- nudges the daemon over D-Bus (`doRegister` + `unregister`) so the new
-  component appears immediately;
-- the actual keybinding is then assigned in the UI and lands in
-  `~/.config/kglobalshortcutsrc` as `[services][<id>.desktop] _launch=...`.
+- подталкивает демона по D-Bus (`doRegister` + `unregister`), чтобы новый
+  компонент появился немедленно;
+- сама привязка клавиши назначается потом в UI и попадает в
+  `~/.config/kglobalshortcutsrc` как `[services][<id>.desktop] _launch=...`.
 
-## Why we do NOT write kglobalshortcutsrc directly
+## Почему мы НЕ пишем kglobalshortcutsrc напрямую
 
-The file is owned and rewritten by the shortcut server at runtime (in Plasma
-6.4+ Wayland the whole kglobalacceld code runs **inside `kwin_wayland`** — on
-this host `org.kde.kglobalaccel` is owned by the `kwin_wayland` PID; the
-standalone `/usr/lib/kglobalacceld` binary and
-`plasma-kglobalaccel.service` exist but are not running). Editing a
-live-managed KConfig file from a second process risks lost updates and
-corruption, and a wrong entry can break the user's shortcuts. The D-Bus API
-(`org.kde.KGlobalAccel`, `/kglobalaccel`, see
-`/usr/share/dbus-1/interfaces/kf6_org.kde.KGlobalAccel.xml`) only registers
-actions for *running applications that receive the keypress signal* — it has
-no "launch this command" registration; command shortcuts are a file-based
-mechanism by design.
+Файл принадлежит и живьём переписывается сервером хоткеев (в Plasma 6.4+
+на Wayland весь код kglobalacceld работает **внутри `kwin_wayland`** — на
+этом хосте `org.kde.kglobalaccel` принадлежит PID `kwin_wayland`;
+автономный бинарник `/usr/lib/kglobalacceld` и
+`plasma-kglobalaccel.service` существуют, но не запущены). Правка
+живьём-управляемого KConfig-файла из второго процесса рискует потерянными
+обновлениями и порчей файла, а ошибочная запись может сломать хоткеи
+пользователя. D-Bus API (`org.kde.KGlobalAccel`, `/kglobalaccel`, см.
+`/usr/share/dbus-1/interfaces/kf6_org.kde.KGlobalAccel.xml`) регистрирует
+действия только для *запущенных приложений, получающих сигнал нажатия* —
+регистрации «запусти вот эту команду» там нет; командные хоткеи по
+замыслу — файловый механизм.
 
-## The soundboard `--write` design (safe automatic path)
+## Дизайн `--write` в soundboard (безопасный автоматический путь)
 
-For each of the first 9 clips (sorted) write ONE self-contained file:
+Для каждого из первых 9 клипов (по алфавиту) пишется ОДИН самодостаточный
+файл:
 
 ```
 ~/.local/share/applications/net.local.soundboard.<slug>.desktop
@@ -87,133 +88,136 @@ For each of the first 9 clips (sorted) write ONE self-contained file:
 # Managed by "soundboard hotkeys --write". Editing is safe; delete to remove.
 [Desktop Entry]
 Type=Application
-Name=Soundboard: <clip>
-Exec=soundboard play <escaped clip name>
+Name=Soundboard: <клип>
+Exec="</абсолютный/путь/soundboard>" play "<экранированное имя клипа>"
 NoDisplay=true
 StartupNotify=false
 X-KDE-GlobalAccel-CommandShortcut=true
 X-KDE-Shortcuts=Alt+N
 ```
 
-- `X-KDE-Shortcuts=Alt+N` is the *default* shortcut, read straight from the
-  desktop file — `kglobalshortcutsrc` stays untouched (override entries are
-  only needed for non-default keys).
-- Discovery goes through ksycoca (path 2 above): `Exec` uses the bare
-  the absolute path of the running soundboard binary (via `current_exe()`),
-  so hotkeys do not depend on the session `PATH`. Re-run registration after
-  moving or reinstalling the binary to a different location.
-- `Exec` escaping per the Desktop Entry Specification: the whole clip name is
-  one double-quoted argument; inside quotes `\`, `"`, `` ` ``, `$` are
-  backslash-escaped and literal newlines/tabs/CRs use the `\n`/`\t`/`\r`
-  sequences; any `%` is doubled to `%%`.
-- Idempotent: deterministic file names (slugified clip, `-2`/`-3` on
-  collision) and content derived purely from `(clip, key)`; re-runs detect
-  unchanged files. Files are only overwritten when they carry our generator
-  marker comment; a foreign file with the same name is never touched. Before
-  an overwrite the previous content is backed up next to the file with a
-  timestamp suffix.
+- `X-KDE-Shortcuts=Alt+N` — *дефолтный* хоткей, читаемый прямо из
+  desktop-файла; `kglobalshortcutsrc` остаётся нетронутым (записи
+  переопределения нужны только для нестандартных клавиш).
+- Обнаружение идёт через ksycoca (путь 2 выше): в `Exec` подставляется
+  абсолютный путь запущенного бинарника soundboard (через
+  `current_exe()`), поэтому хоткеи не зависят от `PATH` сессии. После
+  перемещения или переустановки бинарника в другое место перерегистрируйте
+  хоткеи.
+- Экранирование `Exec` по Desktop Entry Specification: всё имя клипа —
+  один аргумент в двойных кавычках; внутри кавычек `\`, `"`, `` ` ``, `$`
+  экранируются обратным слешем, буквальные новая строка/табуляция/CR —
+  последовательностями `\n`/`\t`/`\r`; любой `%` удваивается до `%%`.
+- Идемпотентность: детерминированные имена файлов (слаг клипа, `-2`/`-3`
+  при коллизии) и содержимое, выводимое чисто из `(клип, клавиша)`;
+  повторные запуски распознают неизменённые файлы. Перезапись — только
+  когда файл несёт наш маркер-комментарий генератора; чужой файл с тем же
+  именем не трогается никогда. Перед перезаписью прежнее содержимое
+  бэкапится рядом с меткой времени.
 
-## In-app management (GUI)
+## Управление из приложения (GUI)
 
-The GUI's «Настройки» view manages the same files in-process (no CLI
-needed): it renders the clip → key table from the current clips, detects
-the registration state by scanning `~/.local/share/applications/` for our
-marker-checked `net.local.soundboard.*.desktop` files and comparing the
-name+content set against the desired one («Хоткеи зарегистрированы» /
-«Хоткеи не зарегистрированы» / «Хоткеи устарели — …»), writes the files
-through the exact same `write_desktop_files` path as `--write`
-(idempotent, backups, foreign files never touched) and then performs the
-live refresh from the next section automatically. «Выключить» removes only
-our marker-checked
-files (backups and foreign lookalikes survive) and refreshes ksycoca. The
-activation rules in the next section apply unchanged.
+GUI на вкладке «Настройки» управляет теми же файлами в своём процессе
+(CLI не нужен): рисует таблицу клип → клавиша по текущим клипам,
+определяет состояние регистрации сканом `~/.local/share/applications/` на
+предмет наших файлов `net.local.soundboard.*.desktop` с маркером и
+сравнением набора имён+содержимого с желаемым («Хоткеи
+зарегистрированы» / «Хоткеи не зарегистрированы» / «Хоткеи устарели —
+…»), пишет файлы ровно тем же путём `write_desktop_files`, что и
+`--write` (идемпотентно, с бэкапами, чужие файлы не трогаются), и затем
+автоматически выполняет живое обновление из следующего раздела.
+«Выключить» удаляет только наши файлы с маркером (бэкапы и чужие
+двойники переживают) и обновляет ksycoca. Правила активации из следующего
+раздела применимы без изменений.
 
-## Live refresh after a rewrite (the "already there" trap)
+## Живое обновление после перезаписи (ловушка «уже есть»)
 
-Verified live 2026-10-12 on Plasma 6.7.5: the daemon reads a service
-component's `Exec` exactly once — at startup (`loadSettings`) and when it
-first notices the component. On ksycoca `databaseChanged`,
-`refreshServices`/`detectAppsWithShortcuts` explicitly skip components that
-already exist (`// already there` → `continue`). Rewriting an existing
-desktop file (e.g. a new `Exec` after the binary moved) therefore leaves
-the daemon holding the STALE service: the shortcut fires, but the launch
-fails — `kwin_wayland` (which hosts kglobalacceld on 6.4+ Wayland) logs
-«Невозможно найти программу "soundboard"» — while the file on disk is
-already correct.
+Проверено живьём 2026-10-12 на Plasma 6.7.5: демон читает `Exec`
+сервисного компонента ровно один раз — при старте (`loadSettings`) и когда
+впервые замечает компонент. По ksycoca `databaseChanged`
+`refreshServices`/`detectAppsWithShortcuts` явно пропускают компоненты,
+которые уже существуют (`// already there` → `continue`). Перезапись
+существующего desktop-файла (например, новый `Exec` после переезда
+бинарника) оставляет демона со СТАРЫМ сервисом: хоткей срабатывает, но
+запуск падает — `kwin_wayland` (где живёт kglobalacceld на 6.4+ Wayland)
+пишет в журнал «Невозможно найти программу "soundboard"» — при уже
+правильном файле на диске.
 
-The daemon re-creates a component only when its storage id reappears after
-being gone (`refreshServices` prunes components whose
-`KService::serviceByStorageId` no longer resolves). The only reliable live
-refresh is therefore a hide/restore dance, implemented in
-`src/ui/kglobalaccel.rs` (`refresh_services`) and run by BOTH the CLI
-`hotkeys --write` and the GUI «Включить/Обновить хоткеи»:
+Демон пересоздаёт компонент, только когда его storage-id снова появляется
+после исчезновения (`refreshServices` вычищает компоненты, чей
+`KService::serviceByStorageId` больше не разрешается). Единственное
+надёжное живое обновление — «танец» скрыть/вернуть, реализованный в
+`src/ui/kglobalaccel.rs` (`refresh_services`) и выполняемый ОБАМИ путями:
+CLI `hotkeys --write` и GUI «Включить/Обновить хоткеи»:
 
-1. rename our `net.local.soundboard.*.desktop` files away and run
-   `kbuildsycoca6`;
-2. poll `org.kde.KGlobalAccel.allComponents` until the components are
-   GONE — mandatory: a refresh pass that still sees the files would keep
-   the stale service object;
-3. rename the files back, `kbuildsycoca6` again;
-4. poll until all components are registered again (now with fresh `Exec`).
+1. переименовать наши `net.local.soundboard.*.desktop` в сторону и
+   выполнить `kbuildsycoca6`;
+2. опрашивать `org.kde.KGlobalAccel.allComponents`, пока компоненты НЕ
+   ИСЧЕЗНУТ — обязательно: проход обновления, который ещё видит файлы,
+   оставит устаревший объект сервиса;
+3. вернуть файлы на место, снова `kbuildsycoca6`;
+4. опрашивать, пока все компоненты не зарегистрируются снова (уже со
+   свежим `Exec`).
 
-Without the daemon (non-Plasma session) the dance degrades to a plain
-`kbuildsycoca6`. Custom user overrides in `kglobalshortcutsrc` survive the
-dance: `KServiceActionComponent::loadSettings` re-reads them on re-create.
+Без демона (не-Plasma сессия) «танец» вырождается в обычный
+`kbuildsycoca6`. Пользовательские переопределения в
+`kglobalshortcutsrc` переживают «танец»:
+`KServiceActionComponent::loadSettings` перечитывает их при
+пересоздании.
 
-## Verifying registration and triggering without a keyboard
+## Проверка регистрации и срабатывание без клавиатуры
 
-- Registered components:
+- Зарегистрированные компоненты:
   `gdbus call --session --dest org.kde.kglobalaccel --object-path
-  /kglobalaccel --method org.kde.KGlobalAccel.allComponents` (component
-  object paths use underscores:
+  /kglobalaccel --method org.kde.KGlobalAccel.allComponents` (в путях
+  объектов компонентов точки заменены на подчёркивания:
   `/component/net_local_soundboard_bruh_desktop`).
-- Binding check:
+- Проверка привязки:
   `gdbus call … --object-path /component/<id> --method
-  org.kde.kglobalaccel.Component.allShortcutInfos` — the key int uses the
-  Qt encoding, `Alt+1` = `0x8000000 | 0x31` = `134217777`.
-- Programmatic trigger (no keyboard; plays the clip for real):
+  org.kde.kglobalaccel.Component.allShortcutInfos` — код клавиши в
+  кодировке Qt, `Alt+1` = `0x8000000 | 0x31` = `134217777`.
+- Программный запуск (без клавиатуры; клип играет по-настоящему):
   `gdbus call … --object-path /component/<id> --method
-  org.kde.kglobalaccel.Component.invokeShortcut '_launch'` — the daemon
-  launches the desktop file via `KIO::ApplicationLauncherJob`; on this
-  host the launch shows up in `journalctl --user` as
-  `Started Soundboard: Bruh.` and as the process
-  `…/soundboard play <clip>`.
-- Launch failures are logged by `kwin_wayland`:
-  `journalctl --user | grep "Невозможно найти программу"` — a sure sign of
-  the stale-Exec trap above (or of a binary path that no longer exists).
+  org.kde.kglobalaccel.Component.invokeShortcut '_launch'` — демон
+  запускает desktop-файл через `KIO::ApplicationLauncherJob`; на этом
+  хосте запуск виден в `journalctl --user` как
+  `Started Soundboard: Bruh.` и как процесс
+  `…/soundboard play <клип>`.
+- Неудачные запуски пишет `kwin_wayland`:
+  `journalctl --user | grep "Невозможно найти программу"` — верный признак
+  ловушки stale Exec выше (или несуществующего пути бинарника).
 
-## Activation
+## Активация
 
-- Usual case: no manual step — `soundboard hotkeys --write` and the GUI
-  «Включить/Обновить хоткеи» perform the full live refresh themselves
-  (hide/restore dance + two `kbuildsycoca6` runs, see above).
-- Guaranteed fallback: log out and back in (the registry loads all paths at
-  startup). On sessions where the standalone daemon runs (X11),
-  `systemctl --user restart plasma-kglobalaccel.service` also works; on
-  Plasma 6.4+ Wayland like this host the server lives in kwin, so do not
-  restart that unit expecting a reload.
+- Обычный случай: ручных шагов нет — `soundboard hotkeys --write` и GUI
+  «Включить/Обновить хоткеи» сами выполняют полное живое обновление
+  («танец» скрыть/вернуть + два `kbuildsycoca6`, см. выше).
+- Гарантированный запасной вариант: выйти и зайти в сессию снова (реестр
+  загружает все пути при старте). На сессиях с автономным демоном (X11)
+  работает и `systemctl --user restart plasma-kglobalaccel.service`; на
+  Plasma 6.4+ Wayland, как на этом хосте, сервер живёт в kwin — перезапуск
+  этой юниты ради перечитывания не поможет.
 
-## Manual path (what the default `soundboard hotkeys` output teaches)
+## Ручной путь (чему учит вывод `soundboard hotkeys`)
 
-System Settings → Keyboard → Shortcuts → **Add New → Command or Script…**,
-paste `soundboard play <clip>`, assign `Alt+N`.
-(Russian UI: Параметры системы → Клавиатура → Комбинации клавиш →
-«Добавить» → «Команда или сценарий…».)
+Параметры системы → Клавиатура → Комбинации клавиш → **Добавить →
+Команда или сценарий…**, вставить `soundboard play <клип>`, назначить
+`Alt+N`.
 
-## Sources
+## Источники
 
-- kglobalacceld daemon: `GlobalShortcutsRegistry` (load/refresh/migrate),
+- Демон kglobalacceld: `GlobalShortcutsRegistry` (load/refresh/migrate),
   `KServiceActionComponent` (launch, write/load) —
   <https://github.com/KDE/kglobalacceld> (`src/globalshortcutsregistry.cpp`,
   `src/kserviceactioncomponent.cpp`).
-- Shortcuts KCM `addCommand` —
+- KCM хоткеев `addCommand` —
   <https://github.com/KDE/plasma-desktop> (`kcms/keys/kcm_keys.cpp`,
   `kcms/keys/globalaccelmodel.cpp`).
-- ksycoca application query semantics —
+- Семантика запроса приложений ksycoca —
   <https://github.com/KDE/kservice> (`src/services/kapplicationtrader.cpp`).
-- D-Bus surface — local introspection:
+- Поверхность D-Bus — локальная интроспекция:
   `/usr/share/dbus-1/interfaces/kf6_org.kde.KGlobalAccel.xml`,
   `kf6_org.kde.kglobalaccel.Component.xml`.
-- Host facts: `plasmashell --version` → 6.7.5; `busctl --user status
-  org.kde.kglobalaccel` → PID of `kwin_wayland`;
-  `pacman -Ql kglobalacceld` → `libKGlobalAccelD.so.0` linked into kwin.
+- Факты хоста: `plasmashell --version` → 6.7.5; `busctl --user status
+  org.kde.kglobalaccel` → PID `kwin_wayland`;
+  `pacman -Ql kglobalacceld` → `libKGlobalAccelD.so.0` слинкован в kwin.

@@ -1,98 +1,108 @@
-# ADR 0004: virtmic as a native Audio/Source/Virtual node
+# ADR 0004: virtmic как нативный узел Audio/Source/Virtual
 
-Date: 2026-10-12
-Status: Accepted (supersedes the pulse null-sink virtual mic from
+Дата: 2026-10-12
+Статус: принят (заменяет pulse null-sink виртуальный микрофон из
 `docs/pipewire-recipe.md` v1 / M1)
 
-## Context
+## Контекст
 
-Zoom filters monitor sources from its microphone list. The M1 design created
-the virtual mic as a pulse `module-null-sink` named `virtmic` and captured
-its monitor `virtmic.monitor` ("Virtual_Mic"). User-confirmed live test
-(device-picker screenshot): Zoom never offers `virtmic.monitor` — it is a
-monitor, so it never appears in Settings → Audio → Microphone. The
-soundboard was therefore unusable as designed for its primary target app.
+Zoom фильтрует монитор-источники из списка микрофонов. Дизайн M1 создавал
+виртуальный микрофон как pulse `module-null-sink` с именем `virtmic` и
+захватывал его монитор `virtmic.monitor` («Virtual_Mic»). Подтверждённый
+пользователем живой тест (скриншот выбора устройств): Zoom никогда не
+предлагает `virtmic.monitor` — это монитор, поэтому он не появляется в
+Настройки → Звук → Микрофон. Саундборд в таком дизайне был непригоден для
+своего основного целевого приложения.
 
-A research slice (user-approved live tests, 2026-10-12) verified the
-replacement: a NATIVE PipeWire node created with
+Исследовательский срез (одобренные пользователем живые тесты, 2026-10-12)
+проверил замену: НАТИВНЫЙ узел PipeWire, создаваемый через
 `pw-cli create-node adapter '{ factory.name=support.null-audio-sink
 node.name=virtmic media.class=Audio/Source/Virtual node.description=
-Virtual_Mic audio.position=[ FL, FR ] object.linger=true }'`. The pulse
-layer exposes it as a REAL source `virtmic` («Monitor of Sink: n/a»,
-HARDWARE flag) — and that source IS listed by Zoom. Feeding works through
-plain `pw-link` port pairs; multiple feeds into one input port are mixed by
-the adapter's soft-mixer (two-tone Goertzel test: both tones at 0.5 FS).
+Virtual_Mic audio.position=[ FL, FR ] object.linger=true }'`. Pulse-слой
+отдаёт его как НАСТОЯЩИЙ источник `virtmic` («Monitor of Sink: n/a»,
+флаг HARDWARE) — и именно этот источник Zoom показывает в списке. Питание
+работает через обычные пары портов `pw-link`; несколько потоков в один
+вход смешиваются софт-микшером адаптера (тест Гёрцеля с двумя тонами:
+оба тона на 0.5 FS).
 
-The earlier "failed variants" verdict was too broad: the broken path was
-driving `media.class=Audio/Source/Virtual` through the pulse module layer
-(`module-null-sink media.class=...` registers no pulse sink and pulse
-loopbacks silently fall back to the default sink). The native pw-cli path
-needs no pulse sink — the node itself is the source.
+Прежний вердикт про «битые варианты» был слишком широк: битой была попытка
+вести `media.class=Audio/Source/Virtual` через pulse-слой модулей
+(`module-null-sink media.class=...` не регистрирует pulse-синк, и pulse
+loopback-ы молча падают в синк по умолчанию). Нативному pw-cli пути
+pulse-синк не нужен — узел сам является источником.
 
-## Decision
+## Решение
 
-`src/graph.rs` reconciles TWO layers:
+`src/graph.rs` реконсилит ДВА слоя:
 
-1. Pulse (unchanged rules): null-sink `soundboard`; optional
-   `soundboard.monitor -> <default_sink>` loopback while `monitoring`.
-2. Native (new):
-   - create the `virtmic` adapter node when absent (match by `node.name`
-     among `pw-cli ls Node`); reuse when present; if MULTIPLE are found,
-     destroy extras keeping the lowest id and warn;
-   - always link `soundboard:monitor_{FL,FR} -> virtmic:input_{FL,FR}`;
-   - when `mic_mix` is on, link
+1. Pulse (правила прежние): null-sink `soundboard`; опциональный
+   `soundboard.monitor -> <синк по умолчанию>` loopback, пока включён
+   `monitoring`.
+2. Нативный (новый):
+   - создать узел-адаптер `virtmic`, когда его нет (поиск по `node.name`
+     среди `pw-cli ls Node`); переиспользовать, когда есть; если найдено
+     НЕСКОЛЬКО — уничтожить лишние, оставив наименьший id, с
+     предупреждением;
+   - всегда связывать `soundboard:monitor_{FL,FR} -> virtmic:input_{FL,FR}`;
+   - при включённом `mic_mix` связывать
      `<real_mic>:capture_{FL,FR} -> virtmic:input_{FL,FR}`.
-   - Links are matched stateless by directed port pairs (as reported by
-     `pw-link -l`): a link is ours iff it touches the `virtmic` node;
-     links between other ports are never touched.
-   - Teardown: destroy our links by port pair, then
-     `pw-cli destroy <virtmic-id>`. The native node has no pulse owner
-     module, so `pw-cli` is the only removal path.
+     (Позже заменено на микшерную цепочку — ADR 0005.)
+   - Связи сопоставляются без состояния по направленным парам портов (как
+     их отдаёт `pw-link -l`): связь наша, если касается узла `virtmic`;
+     связи между другими портами никогда не трогаются.
+   - Разборка: уничтожить наши связи по парам портов, затем
+     `pw-cli destroy <virtmic-id>`. У нативного узла нет pulse-модуля-
+     владельца, поэтому `pw-cli` — единственный путь удаления.
 
-State file schema bumped to version 2 (`native_nodes: [{id, name}]` added).
-Native matching is BY NAME, not by state: a lost state file is recovered by
-the `node.name` / port-pair adoption on the next `up` (a v1 file is dropped
-whole and everything re-adopts).
+Схема state-файла поднята до версии 2 (добавлено
+`native_nodes: [{id, name}]`). Нативное сопоставление — ПО ИМЕНИ, не по
+состоянию: потерянный state-файл восстанавливается усыновлением по
+`node.name` / паре портов на следующем `up` (файл v1 выбрасывается целиком,
+всё переусыновляется).
 
-The pulse capture constant changes from `virtmic.monitor` to `virtmic`
-(`SOURCE_VIRTMIC`); the meter and `vu_probe` capture it. The user-facing
-surface is unchanged: the conferencing app selects "Virtual_Mic", playback
-target stays `soundboard`.
+Константа pulse-захвата меняется с `virtmic.monitor` на `virtmic`
+(`SOURCE_VIRTMIC`); метр и `vu_probe` захватывают её. Пользовательская
+поверхность не меняется: приложение связи выбирает «Virtual_Mic», цель
+воспроизведения остаётся `soundboard`.
 
-## Alternatives considered
+## Рассмотренные альтернативы
 
-- **module-pipe-source + a relay process** (read the soundboard monitor
-  from a daemon and write into a FIFO source): a permanent relay process to
-  supervise, restart, and own; latency and underrun behavior on the FIFO;
-  rejected as the most moving parts for the least fidelity.
-- **Duplex application node** (soundboard itself becomes a PipeWire node
-  with capture+playback ports): would put the whole DSP in-process; a much
-  bigger rewrite of the player model for M7, and the adapter approach was
-  already verified. Revisit if per-feed volume control inside the node is
-  ever needed.
-- **Static `pipewire.conf.d` fragment** declaring the node + links at
-  daemon level: survives daemon restarts, but is machine-global config the
-  app would have to install AND track (idempotent edits of system config;
-  the `down` story becomes "edit /etc-grade files"), and it leaves the
-  node running for all users/sessions regardless of the soundboard state.
-  Rejected; the app-managed lifecycle (linger node + links) matches the
-  existing pulse module model.
+- **module-pipe-source + процесс-ретранслятор** (читать монитор саундборда
+  из демона и писать в FIFO-источник): постоянный релейный процесс,
+  который надо надзоровить, перезапускать и владеть им; задержка и
+  поведение при недогрузке на FIFO; отвергнуто как максимум движущихся
+  частей при минимуме точности.
+- **Дуплексный узел приложения** (сам саундборд становится узлом PipeWire
+  с портами захвата+воспроизведения): уложило бы весь DSP в процесс;
+  намного более крупная переделка модели плеера ради M7, а подход с
+  адаптером уже был проверен. Вернуться, когда понадобится пер-потоковая
+  громкость внутри узла.
+- **Статический фрагмент `pipewire.conf.d`**, объявляющий узел + связи на
+  уровне демона: переживает рестарты демона, но это машинно-глобальный
+  конфиг, который приложение должно устанавливать И отслеживать
+  (идемпотентные правки системного конфига; история `down` превращается в
+  «правь файлы уровня /etc»), и узел продолжает работать для всех
+  пользователей/сессий независимо от состояния саундборда. Отвергнуто;
+  управляемый приложением жизненный цикл (узел linger + связи) совпадает с
+  существующей моделью pulse-модулей.
 
-## Consequences
+## Последствия
 
-- **No pulse owner module**: `virtmic` cannot be removed via `pactl`;
-  teardown is `pw-cli destroy` only. Teardown verification must check
-  `pw-cli ls Node`, not just `pactl list short modules`.
-- **Duplicate-name race**: two concurrent `up` invocations could each
-  create a `virtmic` node before either lists the other's. The next `up`
-  reconciles the duplicates away (lowest id kept, extras destroyed with a
-  warning). Documented, not locked (no server-side name reservation).
-- **Node/link lifecycle = daemon lifecycle**: a pipewire daemon restart
-  kills the node and its links, exactly like pulse modules die on a
-  pipewire-pulse restart. Recovery is the same: run `up` (or reopen the
-  GUI, which auto-reconciles at startup).
-- Conferencing apps see the source as a real mic-shaped device; the doctor
-  check "источник virtmic … не является монитором" pins the regression: if
-  the graph ever regresses to a monitor-named-virtmic, doctor fails.
-- `pw-cli`/`pw-link` binaries become runtime requirements of the graph
-  layer (they ship with pipewire-audio, same as pw-cat).
+- **Нет pulse-модуля-владельца**: `virtmic` нельзя убрать через `pactl`;
+  разборка — только `pw-cli destroy`. Проверку разборки нужно вести по
+  `pw-cli ls Node`, а не только по `pactl list short modules`.
+- **Гонка одинаковых имён**: два параллельных вызова `up` могут каждый
+  создать узел `virtmic`, прежде чем увидят чужой. Следующий `up`
+  вычищает дубликаты (оставлен наименьший id, лишние уничтожены с
+  предупреждением). Задокументировано, не залочено (нет серверного
+  резервирования имени).
+- **Жизненный цикл узла/связей = жизненный цикл демона**: рестарт демона
+  pipewire убивает узел и его связи, ровно как pulse-модули умирают при
+  рестарте pipewire-pulse. Восстановление то же: выполнить `up` (или
+  открыть GUI, который сам делает reconcile при старте).
+- Приложения связи видят источник как настоящее микрофонное устройство;
+  проверка doctor «источник virtmic … не является монитором» прибивает
+  регрессию: если граф когда-нибудь деградирует до монитора с именем
+  virtmic, doctor упадёт.
+- Бинарники `pw-cli`/`pw-link` становятся требованиями рантайма слоя
+  графа (ставятся вместе с pipewire-audio, как и pw-cat).

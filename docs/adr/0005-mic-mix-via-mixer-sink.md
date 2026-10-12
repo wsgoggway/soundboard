@@ -1,85 +1,90 @@
-# ADR 0005: mic_mix via the sbmicmix mixer sink
+# ADR 0005: mic_mix через микшерный синк sbmicmix
 
-Date: 2026-10-12
-Status: Accepted (bug fix on top of ADR 0004)
+Дата: 2026-10-12
+Статус: принят (исправление бага поверх ADR 0004)
 
-## Context
+## Контекст
 
-User-confirmed bug: ticking «Микс с микрофоном» made the microphone buzz
-loudly («микрофон гудит») on the virtual mic / in the call instead of
-passing voice.
+Подтверждённый пользователем баг: включение «Микс с микрофоном» давало на
+виртуальном микрофоне / в звонке громкий гул («микрофон гудит») вместо
+пропуска голоса.
 
-The old design created DIRECT native port links
-`<real_mic>:capture_{FL,FR} -> virtmic:input_{FL,FR}`. Two live-verified,
-compounding problems (measurements 2026-10-12):
+Старый дизайн создавал ПРЯМЫЕ нативные связи портов
+`<real_mic>:capture_{FL,FR} -> virtmic:input_{FL,FR}`. Две проверенные
+живьём, складывающиеся проблемы (замеры 2026-10-12):
 
-1. **Suspended-mic ENOENT.** A SUSPENDED ALSA source has no PipeWire ports
-   until a capture stream runs on it, so `pw-link` to it fails with ENOENT
-   and the link is silently missing — mic_mix worked only while something
-   else kept the mic awake.
-2. **Self-loop when the default source is virtmic.** `real_mic` was
-   resolved as the pulse DEFAULT SOURCE (excluding only `*.monitor`), but
-   on the user's session the default source IS `virtmic` — they set
-   Virtual_Mic as the system default so Zoom's "Same as System" picks it.
-   The binary then linked `virtmic:capture_* -> virtmic:input_*` — a
-   digital SELF-LOOP: the adapter mixes its own monitor back into its
-   inputs, the node becomes an integrator (`y = input + previous_output`)
-   and the level ramps to float saturation. Measured on room noise through
-   the broken graph: peak 2.77 FS, RMS 1.20 flat, DC 0.146 — the "buzz"
-   was full-scale digital garbage.
+1. **ENOENT у спящего микрофона.** СПЯЩИЙ ALSA-источник не имеет
+   PipeWire-портов, пока на нём не идёт поток захвата, поэтому `pw-link`
+   к нему падает с ENOENT, и связь молча отсутствует — mic_mix работал,
+   только пока что-то другое будило микрофон.
+2. **Самопетля, когда источник по умолчанию — virtmic.** `real_mic`
+   разрешался как pulse ИСТОЧНИК ПО УМОЛЧАНИЮ (исключая только
+   `*.monitor`), но на сессии пользователя источник по умолчанию — сам
+   `virtmic`: пользователь назначил Virtual_Mic системным дефолтом, чтобы
+   «Same as System» в Zoom выбирал его. Бинарник тогда связывал
+   `virtmic:capture_* -> virtmic:input_*` — цифровая САМОПЕТЛЯ: адаптер
+   подмешивает собственный монитор обратно во входы, узел становится
+   интегратором (`y = input + previous_output`), и уровень уходит в
+   float-насыщение. Замерено на шуме комнаты через битый граф: пик
+   2.77 FS, RMS 1.20 плоский, DC 0.146 — «гул» был полноразмерным
+   цифровым мусором.
 
-The fix pattern was PROVEN LIVE on the user's graph before this ADR was
-recorded: null-sink `sbmicmix` + `module-loopback source=<real_mic>
+Схема фикса была ДОКАЗАНА ЖИВЬЁМ на графе пользователя до записи этого
+ADR: null-sink `sbmicmix` + `module-loopback source=<real_mic>
 sink=sbmicmix` + `pw-link sbmicmix:monitor_{FL,FR} virtmic:input_{FL,FR}`.
-Same 3 s room-noise capture of `virtmic` after the switch: peak
-2.77 → **0.21** FS, RMS 1.20 → **0.044** FS — clean.
+Тот же 3 с захват шума комнаты с `virtmic` после переключения: пик
+2.77 → **0.21** FS, RMS 1.20 → **0.044** FS — чисто.
 
-## Decision
+## Решение
 
-When `mic_mix` is on, the desired state is THREE reconciled pieces:
+При включённом `mic_mix` желаемое состояние — ТРИ реконсилируемые части:
 
 1. pulse `module-null-sink sink_name=sbmicmix media.class=Audio/Sink
-   sink_properties=device.description=SB_MicMix` — the mixer;
-2. pulse `module-loopback source=<real_mic> sink=sbmicmix` — keeps the mic
-   awake (no ENOENT) and resamples; re-created when the resolved mic
-   changes (same exact-args semantics as the monitoring loopback);
-3. native links `sbmicmix:monitor_{FL,FR} -> virtmic:input_{FL,FR}`
-   (port-pair matched, like the memes feed).
+   sink_properties=device.description=SB_MicMix` — микшер;
+2. pulse `module-loopback source=<real_mic> sink=sbmicmix` — держит
+   микрофон бодрствующим (нет ENOENT) и ресемплирует; пересоздаётся при
+   смене определённого микрофона (та же семантика точных аргументов, что
+   у monitoring loopback);
+3. нативные связи `sbmicmix:monitor_{FL,FR} -> virtmic:input_{FL,FR}`
+   (сопоставление по парам портов, как у клип-потока).
 
-Direct `<mic>:capture_* -> virtmic:input_*` links are NEVER desired; the
-reconciler destroys any such link of ours that is not in the desired set —
-including pre-existing `virtmic -> virtmic` self-loops (regression-tested;
-also flagged by a dedicated `doctor` «самопетля» check).
+Прямые связи `<mic>:capture_* -> virtmic:input_*` никогда не являются
+желаемыми; reconciler уничтожает любую такую нашу связь, которой нет в
+желаемом наборе — включая существующие самопетли `virtmic -> virtmic`
+(покрыто регрессионным тестом; отдельно флажится проверкой doctor
+«самопетля»).
 
-`real_mic` resolution is a pure function: candidates = pulse sources minus
-`virtmic` and all monitors (flag or `*.monitor` name); prefer the current
-default source when usable, else the first `alsa_input.*`; none → the mic
-path is skipped with a Russian warning and `doctor` FAILs. `doctor` shows
-the resolved mic honestly (default vs fallback) and checks the mixer
-triple (sink, loopback, links) iff `mic_mix` is on.
+Разрешение `real_mic` — чистая функция: кандидаты = pulse-источники минус
+`virtmic` и все мониторы (по флагу или имени `*.monitor`); приоритет у
+текущего источника по умолчанию, если пригоден, иначе первый
+`alsa_input.*`; никого → mic-путь пропускается с русским предупреждением,
+`doctor` падает. `doctor` честно показывает найденный микрофон (дефолт или
+запасной) и проверяет микшерную тройку (синк, loopback, связи), только
+если `mic_mix` включён.
 
-## Alternatives considered
+## Рассмотренные альтернативы
 
-- **Direct port links (the old design)** — broken in the two ways above;
-  kept only as a documented failed variant in the recipe.
-- **PipeWire filter-chain** mixing mic + monitor into virtmic — more
-  moving parts (an SPA filter node to author and version), no benefit over
-  the pulse mixer sink for a 2-input sum; rejected as complexity without a
-  payoff.
-- **Refuse to run when the default source is virtmic** (an intermediate
-  unshipped draft made mic_mix a no-op with a warning) — rejected: it
-  punished the user's sensible setup (virtmic as system default) instead of
-  just working via the fallback resolution.
+- **Прямые связи портов (старый дизайн)** — сломан обоими способами выше;
+  оставлен только как документированный битый вариант в рецепте.
+- **PipeWire filter-chain**, смешивающая микрофон + монитор в virtmic —
+  больше движущихся частей (SPA-фильтр-узел, который надо написать и
+  версионировать), никакой выгоды против pulse-микшерного синка для суммы
+  двух входов; отвергнуто как сложность без выигрыша.
+- **Отказываться работать, когда источник по умолчанию — virtmic**
+  (промежуточный невышедший черновик делал mic_mix no-op с
+  предупреждением) — отвергнуто: наказывало пользователя за разумную
+  настройку (virtmic как системный дефолт) вместо того, чтобы просто
+  работать через запасное разрешение.
 
-## Consequences
+## Последствия
 
-- `mic_mix = true` adds one null-sink and one loopback module (+2 pulse
-  modules in `modules.json`); `mic_mix = false` tears them back down.
-- The real mic stays awake while mic_mix is on (the loopback is a capture
-  stream) — that is the fix for the ENOENT trap, at the usual small idle
-  power cost of an open mic.
-- The user keeps virtmic as the system default source; resolution falls
-  back to the first `alsa_input.*` source, and `doctor` says which mic was
-  picked.
-- A manual `virtmic:* -> virtmic:*` self-loop (the buzz regression) is
-  cleaned by the next `up` and flagged by `doctor`.
+- `mic_mix = true` добавляет один null-sink и один loopback-модуль (+2
+  pulse-модуля в `modules.json`); `mic_mix = false` разбирает их обратно.
+- Реальный микрофон не «засыпает», пока включён mic_mix (loopback — это
+  поток захвата) — это и есть фикс ловушки ENOENT, ценой обычного
+  небольшого расхода энергии открытого микрофона в простое.
+- Пользователь может оставить virtmic системным источником по умолчанию;
+  разрешение падает на первый источник `alsa_input.*`, а `doctor`
+  сообщает, какой микрофон выбран.
+- Ручная самопетля `virtmic:* -> virtmic:*` (регрессия с гулом)
+  вычищается следующим `up` и флажится `doctor`.

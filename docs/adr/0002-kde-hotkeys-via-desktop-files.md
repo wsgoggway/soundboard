@@ -1,98 +1,108 @@
-# ADR 0002: KDE hotkeys via generated .desktop files
+# ADR 0002: хоткеи KDE через сгенерированные .desktop-файлы
 
-Date: 2026-10-12. Status: accepted (M4). Research base: `docs/kde-hotkeys.md`.
+Дата: 2026-10-12. Статус: принят (M4). Исследовательская база:
+`docs/kde-hotkeys.md`.
 
-## Context
+## Контекст
 
-Clips must be playable from anywhere (conferencing app in focus, game
-fullscreen) with a keypress. The host is CachyOS with KDE Plasma 6.7.5 on a
-Wayland session.
+Клипы должны запускаться откуда угодно (приложение связи в фокусе, игра в
+полный экран) нажатием клавиши. Хост — CachyOS с KDE Plasma 6.7.5 на
+сессии Wayland.
 
-Verified facts about Plasma 6 global shortcuts (see `docs/kde-hotkeys.md` for
-sources and D-Bus evidence):
+Проверенные факты о глобальных хоткеях Plasma 6 (источники и D-Bus
+свидетельства — в `docs/kde-hotkeys.md`):
 
-- On Plasma 6.4+ Wayland **kglobalacceld runs inside `kwin_wayland`** (the
-  standalone daemon binary and `plasma-kglobalaccel.service` exist but are
-  not running). There is no separate daemon process to talk to.
-- The D-Bus API (`org.kde.KGlobalAccel`) only registers actions for *running
-  applications that receive the keypress signal*; it has **no "launch this
-  command" registration**. Command shortcuts are a file-based mechanism by
-  design.
-- `~/.config/kglobalshortcutsrc` is the shortcut registry, but it is owned
-  and rewritten live by the shortcut server. Editing it from a second
-  process risks lost updates and corruption, and a wrong entry can break the
-  user's existing shortcuts.
-- What System Settings itself does for "Add New → Command or Script" is the
-  model to copy: it writes a self-contained `.desktop` file with
-  `X-KDE-GlobalAccel-CommandShortcut=true` into
-  `~/.local/share/applications/`, and the daemon picks command shortcuts up
-  through **ksycoca** (which includes the user applications directory and
-  supports live refresh after `kbuildsycoca6`). The default shortcut comes
-  straight from the file's `X-KDE-Shortcuts` entry — no
-  `kglobalshortcutsrc` entry is needed unless the user rebinds the key.
+- На Plasma 6.4+ Wayland **kglobalacceld работает внутри `kwin_wayland`**
+  (автономный бинарник демона и `plasma-kglobalaccel.service` существуют,
+  но не запущены). Отдельного процесса демона, с которым можно
+  разговаривать, нет.
+- D-Bus API (`org.kde.KGlobalAccel`) регистрирует действия только для
+  *запущенных приложений, получающих сигнал нажатия*; регистрации
+  **«запусти эту команду» там нет**. Командные хоткеи по замыслу —
+  файловый механизм.
+- `~/.config/kglobalshortcutsrc` — реестр хоткеев, но файл принадлежит и
+  живьём переписывается сервером хоткеев. Правка его из второго процесса
+  рискует потерянными обновлениями и порчей, а ошибочная запись может
+  сломать хоткеи пользователя.
+- То, что Параметры системы сами делают для «Добавить → Команда или
+  сценарий», — образец для копирования: они пишут самодостаточный
+  `.desktop`-файл с `X-KDE-GlobalAccel-CommandShortcut=true` в
+  `~/.local/share/applications/`, а демон подхватывает командные хоткеи
+  через **ksycoca** (включает каталог приложений пользователя и
+  поддерживает живое обновление после `kbuildsycoca6`). Клавиша по
+  умолчанию берётся прямо из записи `X-KDE-Shortcuts` файла — запись в
+  `kglobalshortcutsrc` нужна, только если пользователь переназначит
+  клавишу.
 
-## Decision
+## Решение
 
-`soundboard hotkeys --write` generates one self-contained desktop file per
-clip into the user applications directory:
+`soundboard hotkeys --write` генерирует один самодостаточный desktop-файл
+на клип в каталог приложений пользователя:
 
 ```
 ~/.local/share/applications/net.local.soundboard.<slug>.desktop
 ```
 
-with `Type=Application`, `NoDisplay=true`, `StartupNotify=false`,
-`X-KDE-GlobalAccel-CommandShortcut=true`, `X-KDE-Shortcuts=Alt+N` (the
-default binding) and `Exec=soundboard play "<clip>"` (escaped per the
-Desktop Entry Specification: quoted argument, `\`, `"`, `` ` ``, `$`
-backslash-escaped, `\n`/`\t`/`\r` sequences, `%` doubled).
+с `Type=Application`, `NoDisplay=true`, `StartupNotify=false`,
+`X-KDE-GlobalAccel-CommandShortcut=true`, `X-KDE-Shortcuts=Alt+N` (клавиша
+по умолчанию) и `Exec="<абсолютный путь бинарника>" play "<клип>"`
+(экранирование по Desktop Entry Specification: аргумент в кавычках, `\`,
+`"`, `` ` ``, `$` экранируются обратным слешем, последовательности
+`\n`/`\t`/`\r`, `%` удваивается).
 
-Safety rules, enforced by `src/hotkeys.rs`:
+Правила безопасности, соблюдаемые `src/hotkeys.rs`:
 
-- **Written only by soundboard**: the first line is a generator marker
-  (`# Managed by "soundboard hotkeys --write"...`). A same-named file
-  *without* the marker is never touched (skipped with a warning).
-- **Backups**: an existing generated file is backed up next to itself
-  (`<name>.bak.<millis-timestamp>`) before an overwrite.
-- **Idempotent**: file names and content are deterministic functions of
-  `(clip, key)`; unchanged files are not rewritten and produce no backups,
-  so re-running `--write` is a no-op.
-- **kglobalshortcutsrc is never modified** by soundboard.
-- Without `--write`, the command only prints the clip → key → command table
-  plus manual registration steps for System Settings.
+- **Пишутся только самим soundboard**: первая строка — маркер генератора
+  (`# Managed by "soundboard hotkeys --write"...`). Одноимённый файл
+  *без* маркера никогда не трогается (пропускается с предупреждением).
+- **Бэкапы**: существующий сгенерированный файл бэкапится рядом с собой
+  (`<имя>.bak.<метка-времени-в-мс>`) перед перезаписью.
+- **Идемпотентность**: имена файлов и содержимое — детерминированные
+  функции от `(клип, клавиша)`; неизменённые файлы не перезаписываются и
+  не порождают бэкапов, поэтому повторный `--write` — no-op.
+- **`kglobalshortcutsrc` никогда не изменяется** soundboard.
+- Без `--write` команда только печатает таблицу клип → клавиша → команда
+  плюс шаги ручной регистрации в Параметрах системы.
 
-## Alternatives considered
+## Рассмотренные альтернативы
 
-- **Edit `~/.config/kglobalshortcutsrc` directly**: rejected — the file is
-  live-managed by the daemon running inside `kwin_wayland`; concurrent
-  writes risk lost updates/corruption, and malformed entries can take down
-  the user's whole shortcut set.
-- **Manual-only** (System Settings → Add New → Command or Script): safe and
-  the officially supported path, but tedious for nine clips; kept as the
-  printed fallback and the mental model for the generated files.
-- **Tauri/Electron-style in-app global hotkeys**: would require a resident
-  soundboard process plus a registration API that KDE does not offer for
-  command shortcuts (the D-Bus API signals running apps only). The
-  soundboard is deliberately daemon-free — `soundboard play` exits right
-  after spawning `pw-cat`.
+- **Править `~/.config/kglobalshortcutsrc` напрямую**: отвергнуто — файл
+  живьём управляется демоном внутри `kwin_wayland`; параллельные записи
+  рискуют потерей обновлений/порчей, а битые записи могут уронить весь
+  набор хоткеев пользователя.
+- **Только ручная привязка** (Параметры системы → Добавить → Команда или
+  сценарий): безопасно и официально поддерживается, но муторно для девяти
+  клипов; оставлено как печатаемый запасной путь и мысленная модель
+  генерируемых файлов.
+- **Глобальные хоткеи внутри приложения в стиле Tauri/Electron**:
+  потребовали бы резидентного процесса soundboard плюс API регистрации,
+  которого KDE для командных хоткеев не даёт (D-Bus API сигналит только
+  запущенным приложениям). Soundboard сознательно без демона —
+  `soundboard play` выходит сразу после запуска `pw-cat`.
 
-## Consequences
+## Последствия
 
-- **Activation is not instant**: run `kbuildsycoca6` (the daemon follows the
-  ksycoca `databaseChanged` signal); the guaranteed fallback is re-login.
-  The CLI prints both after writing. No D-Bus nudge is attempted (System
-  Settings has one; calling it is out of scope and version-fragile).
-- **Only the first 9 clips** (sorted by name) get keys, `Alt+1`…`Alt+9`;
-  clips beyond that are listed as unmapped in the table (the Alt+digit
-  space is what Plasma users expect; extending to other modifiers is future
-  work).
-- **Slug collisions** are resolved deterministically: the slug is the
-  lowercased ASCII-alphanumeric run of the clip name (everything else
-  collapses to `-`, an empty result becomes `clip`), and colliding slugs
-  get `-2`, `-3`, … suffixes. Cyrillic-only names therefore slugify to
-  `clip`, `clip-2`, …
-- **The binary must stay on `PATH`**: `Exec` uses the bare `soundboard`
-  command, resolved by the launching session.
-- Users may edit or delete generated files freely (the marker says so);
-  deleting a file removes its shortcut after the next ksycoca refresh.
-- Files with `NoDisplay=true` are invisible in app menus and launchers (as
-  intended); the ksycoca-based discovery path does not exclude them.
+- **Активация не мгновенна**: нужен `kbuildsycoca6` (демон следит за
+  сигналом ksycoca `databaseChanged`); гарантированный запасной вариант —
+  перелогин. После перезаписи существующих файлов одного
+  `kbuildsycoca6` мало: демон держит устаревший `Exec`, поэтому и CLI, и
+  GUI выполняют «танец» скрыть/вернуть с опросом демона
+  (`src/ui/kglobalaccel.rs`, детали в `docs/kde-hotkeys.md`).
+- **Только первые 9 клипов** (по алфавиту) получают клавиши, `Alt+1`…`Alt+9`;
+  остальные клипы показываются в таблице как непривязанные (пространство
+  Alt+цифра — то, чего ждут пользователи Plasma; расширение на другие
+  модификаторы — будущая работа).
+- **Коллизии слагов** разрешаются детерминированно: слаг — нижнерегистровая
+  ASCII-буквоцифровая последовательность имени клипа (всё остальное
+  схлопывается в `-`, пустой результат становится `clip`), коллизирующие
+  слаги получают суффиксы `-2`, `-3`, … Имена из одних кириллических букв
+  поэтому слагуются в `clip`, `clip-2`, …
+- **`Exec` встраивает абсолютный путь бинарника** (через `current_exe()` в
+  момент регистрации), так что хоткеи не зависят от `PATH` сессии;
+  после перемещения или переустановки бинарника в другое место регистрацию
+  нужно повторить (`--write` или кнопка GUI).
+- Пользователи могут свободно править и удалять сгенерированные файлы (об
+  этом говорит маркер); удаление файла снимает хоткей после следующего
+  обновления ksycoca.
+- Файлы с `NoDisplay=true` невидимы в меню приложений и лаунчерах (как и
+  задумано); путь обнаружения через ksycoca их не исключает.

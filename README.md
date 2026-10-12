@@ -1,234 +1,418 @@
 # soundboard
 
-A Rust + GTK4 soundboard for video calls on Linux: it creates a PipeWire
-virtual microphone (the native `Audio/Source/Virtual` node `virtmic`, shown
-to apps as **Virtual_Mic**) and plays short meme audio clips into it, so a
-keypress or click "says" it straight into the call while your real
-microphone keeps working. Works with any conferencing app that captures a
-microphone: Zoom, Google Meet, Telegram, Jitsi, Discord, …
+Саундборд для видеозвонков в Linux: создаёт в PipeWire виртуальный микрофон —
+нативный узел `Audio/Source/Virtual` с именем `virtmic`, который в списках
+устройств приложений показан как **Virtual_Mic** — и проигрывает короткие
+аудиоклипы прямо в него. Нажатие горячей клавиши или клик по кнопке «звучит»
+в звонке, пока настоящий микрофон продолжает работать. Работает с любым
+приложением связи, где выбирается микрофон: Zoom, Google Meet, Telegram,
+Jitsi, Discord и т.д.
 
-## Features
+Интерфейс — GTK4/libadwaita (окно, системный трей) плюс полноценный CLI.
 
-- PipeWire virtual microphone built as a native `Audio/Source/Virtual`
-  node plus `pw-link` feeds (see `docs/pipewire-recipe.md`,
-  [ADR 0004](docs/adr/0004-virtmic-native-source-node.md)) — idempotent
-  `up`/`down`/`doctor` management. Conferencing apps list it as a real
-  microphone (they filter monitor sources — exactly why the native node is
-  used).
-- GTK4/libadwaita GUI on a three-view `gtk::Stack` («Саундборд» daily
-  board, «Настройки», «Дебаг»): clip grid with playing highlight, live VU
-  meter, volume, mic-mix / hear-yourself / re-click-interrupt toggles, a
-  failure banner that jumps to the debug view, error toasts.
-- System tray presence (Plasma StatusNotifierItem via `ksni`): closing the
-  window hides it to the tray while the app keeps running — the audio
-  graph, the meter and hotkey-spawned clips stay alive; the tray menu has
-  «Показать/Скрыть окно», «Стоп всё», a graph-status line and «Выход»
-  (graceful shutdown, then exit). Launching a second instance just raises
-  (and un-hides) the existing window.
-- CLI playback (`play`/`stop`) that works across processes, including
-  stopping playbacks started by an earlier command.
-- Per-clip interrupt or overlap playback modes; clips auto-rescan from disk.
-- KDE Plasma 6 global hotkeys (`Alt+1..9`) via generated `.desktop` files,
-  managed in-app («Настройки» → «Глобальные хоткеи») or from the CLI.
-- Russian user-facing strings, English identifiers and docs.
+## Как это работает
 
-## Architecture
+При запуске программа сама собирает в вашей звуковой подсистеме PipeWire
+виртуальный микрофон и маршрутизацию:
 
-Overview, component responsibilities and the verified audio topology
-diagram live in [`docs/hld.md`](docs/hld.md). Short version: clips are
-played by a `pw-cat` subprocess into the `soundboard` null-sink, `pw-link`
-routes its monitor ports into the native `virtmic` source node, the
-conferencing app captures the pulse source `virtmic` ("Virtual_Mic"); with
-`mic_mix` the
-real microphone is mixed into the same inputs through the `sbmicmix` mixer
-sink (ADR 0005), with `monitoring` a loopback duplicates clips to the real
-speakers.
-Design decisions: [ADR 0001](docs/adr/0001-pwcat-player-process-model.md)
-(pw-cat process model), [ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md)
-(KDE hotkeys), [ADR 0003](docs/adr/0003-gui-toolkit-gtk4.md) (GUI toolkit),
-[ADR 0004](docs/adr/0004-virtmic-native-source-node.md) (native virtual
-mic).
+1. Клипы играются процессом `pw-cat` в служебный синк `soundboard`
+   (pulse-слой, описание «Meme_Soundboard»).
+2. Монитор-порты этого синка связываются через `pw-link` со входами
+   нативного узла `virtmic` (`Audio/Source/Virtual`, описание
+   «Virtual_Mic») — именно этот узел приложения связи видят как настоящий
+   микрофон.
+3. При включённом «Микс с микрофоном» (`mic_mix`) настоящий микрофон
+   попадает в те же входы через микшерную цепочку: pulse-синк `sbmicmix`
+   («SB_MicMix») + `module-loopback` с реального микрофона (он держит
+   микрофон «бодрствующим» и правильно ресемплирует) + связи
+   `sbmicmix:monitor_* -> virtmic:input_*`. Несколько потоков в один вход
+   смешиваются софт-микшером адаптера.
+4. При включённом «Слышать себя» (`monitoring`) ещё один loopback
+   дублирует клипы в реальные колонки (синк по умолчанию).
+5. Приложение связи пишет в pulse-источник `virtmic` — это реальный
+   (не монитор!) источник, поэтому оно его показывает и записывает.
 
-## Requirements
+```mermaid
+%%{init: {'flowchart': {'curve': 'linear'}}}%%
+flowchart LR
+    CLIPS["Клипы<br/>~/Music/soundboard-clips"]
+    SB["синк soundboard<br/>Meme_Soundboard (pulse)"]
+    MIC["реальный микрофон<br/>определённый источник (не virtmic)"]
+    SBM["синк sbmicmix<br/>SB_MicMix (pulse)"]
+    VM["узел virtmic<br/>Audio/Source/Virtual (нативный)"]
+    RS["реальные колонки<br/>синк по умолчанию"]
+    LB["monitoring loopback<br/>(pulse)"]
+    CONF["приложение связи<br/>микрофон = Virtual_Mic"]
+    VU["VU-метр<br/>GUI и vu_probe"]
 
-Linux with PipeWire (developed and verified on CachyOS / Arch):
+    CLIPS -->|"pw-cat"| SB
+    SB -->|"pw-link monitor_FL/FR"| VM
+    MIC -.->|"module-loopback (mic_mix)"| SBM
+    SBM -.->|"pw-link monitor_FL/FR"| VM
+    SB -.->|"module-loopback (monitoring)"| LB
+    LB --> RS
+    VM -->|"pulse-источник virtmic"| CONF
+    VM -->|"съём сигнала"| VU
+```
 
-- `pipewire`, `pipewire-pulse` (the pulse-compatible session; `pw-cat`,
-  `pw-cli` and `pw-link` ship with the PipeWire audio utilities package,
-  `pipewire-audio` on Arch)
-- `gtk4`, `libadwaita` (GUI build/runtime libraries)
-- Rust toolchain via [mise](https://mise.jdx.dev) (pinned `stable` in
-  `mise.toml`)
+Сплошные рёбра — постоянный путь; пунктирные существуют только при
+включённых `mic_mix` / `monitoring`. Ссылки в `virtmic` пересчитываются при
+изменении устройств: mic-mix loopback перецеливается на актуальный реальный
+микрофон (источник по умолчанию, иначе первый `alsa_input.*`; никогда
+`virtmic` или монитор), monitoring loopback следует за синком по умолчанию.
 
-## Sounds
+Ключевые механизмы:
 
-The repo bundles the meme clips (14 files, `clips/`). Copy them into the
-default clips directory (no-clobber) with:
+- **Автонастройка графа.** Граф — желаемое состояние (desired state):
+  идемпотентный reconcile приводит сессию к нему при каждом запуске GUI,
+  перед `play` и по кнопке «Починить граф». Недостающее создаётся, наше
+  устаревшее пересоздаётся/удаляется, чужие модули и связи не трогаются.
+- **State-файл владения.** Всё, что создала программа, записывается в
+  `~/.local/state/soundboard/modules.json` (схема v2: индексы pulse-модулей
+  + имена, id нативных узлов + имена). `soundboard down` выгружает только
+  записанное там. Потеря файла не фатальна: `up` «усыновляет» модули с
+  точно совпадающими аргументами, нативный узел ищется по имени.
+- **doctor с самопроверкой.** Команда `soundboard doctor` (и вкладка
+  «Дебаг») проверяет pulse-сервер, синк, источник `virtmic` (и что он не
+  монитор), нативный узел, связи, отсутствие самопетли, наличие реального
+  микрофона и mic-mix/monitoring-цепочки. Код выхода 1 — если найдены
+  проблемы.
+- **Плеер `pw-cat`.** Один процесс `pw-cat --playback --target soundboard`
+  на клип, своя группа процессов, остановка SIGTERM→SIGKILL. CLI умеет
+  останавливать чужие запуски: `soundboard stop` находит играющие
+  `pw-cat --target soundboard` сканом `/proc`.
+- **Планировщик (пер-клиповый interrupt).** Повторное нажатие того же клипа
+  перезапускает его (предыдущее проигрывание останавливается), разные клипы
+  играют одновременно и накладываются. Тумблер «Перезапускать клип
+  повторным нажатием» выключает прерывание — тогда клипы всегда играют
+  копиями поверх.
+- **Глобальные хоткеи.** Для первых девяти клипов генерируются
+  `.desktop`-файлы с `X-KDE-Shortcuts=Alt+N`; их подхватывает Plasma
+  (kglobalaccel + ksycoca). Подробности ниже.
+
+## Требования
+
+Проверено на CachyOS / Arch (актуальный PipeWire, Plasma 6):
+
+- `pipewire`, `pipewire-pulse` — звуковая подсистема и pulse-совместимый
+  слой;
+- утилиты PipeWire `pw-cat`, `pw-cli`, `pw-link` (на Arch — пакет
+  `pipewire-audio`);
+- `gtk4`, `libadwaita` — библиотеки GUI (сборка и запуск);
+- Rust-тулчейн через [mise](https://mise.jdx.dev) (в `mise.toml` закреплён
+  `stable`);
+- **KDE Plasma** — нужна для системного трея и глобальных хоткеев. Без
+  трея приложение работает в оконном режиме (закрытие окна = выход);
+  хоткеи без Plasma можно назначить вручную в вашем окружении по таблице
+  из `soundboard hotkeys`.
+
+## Установка
 
 ```sh
-just clips-install
+mise install            # rust-тулчейн по mise.toml
+cargo install --path .  # бинарник soundboard в ~/.cargo/bin
+just clips-install      # скопировать звуки из репозитория (14 клипов, без перезаписи)
 ```
 
-## Install
+`just clips-install` кладёт встроенные клипы из каталога `clips/` в
+`~/Music/soundboard-clips` (файлы, которые уже существуют, не трогаются).
 
-```bash
-mise install            # rust toolchain per mise.toml
-cargo install --path .  # installs the `soundboard` binary to ~/.cargo/bin
-```
+**Бинарник в PATH.** `cargo install` кладёт его в `~/.cargo/bin` — убедитесь,
+что каталог в `PATH` (при желании сделайте симлинк:
+`ln -s ~/.cargo/bin/soundboard ~/.local/bin/soundboard`). Файлы хоткеев
+встраивают абсолютный путь бинарника на момент регистрации, поэтому работают
+независимо от `PATH`; если переместили или переустановили бинарник в другое
+место — перерегистрируйте хоткеи (`soundboard hotkeys --write` или кнопка в
+GUI).
 
-**PATH note:** hotkey files embed the absolute path of the binary that
-registered them (`current_exe()`), so they work regardless of `PATH`. If you
-move or reinstall the binary elsewhere, re-run `soundboard hotkeys --write`
-(or the GUI button) to update the paths.
+## Быстрый старт
 
-## Quick start
+1. Положите клипы в `~/Music/soundboard-clips` (например,
+   `just clips-install`). Форматы: `wav`, `mp3`, `ogg`, `oga`, `flac`,
+   `opus`, `m4a`; имя клипа = имя файла без расширения.
+2. Запустите `soundboard` — GUI стартует и **сам** поднимает аудиограф
+   (строка «Граф: OK»; при проблемах появится баннер со ссылкой на
+   «Дебаг»).
+3. В приложении связи выберите микрофон **Virtual_Mic**
+   (Zoom: Настройки → Звук; в Google Meet, Telegram, Jitsi, Discord —
+   аналогично). Если в приложении было выбрано другое устройство —
+   перевыберите: приложения кэшируют выбранный вход.
+4. Жмите кнопки клипов в окне или `Alt+1`…`Alt+9` в любом приложении —
+   звук идёт в звонок; VU-метр «Виртуальный микрофон» показывает уровень.
+5. Проверка цепочки без звонка: кнопка **Тест** на вкладке «Дебаг» —
+   2-секундный тон 440 Гц в виртуальный микрофон.
 
-1. Drop clips into `~/Music/soundboard-clips`
-   (`wav`/`mp3`/`ogg`/`oga`/`flac`/`opus`/`m4a`; file stem = clip name).
-2. Run `soundboard` — the GUI starts and sets up the audio graph
-   automatically at launch.
-3. In your conferencing app's audio settings (Zoom: Настройки → Звук;
-   Google Meet, Telegram, Jitsi, Discord — similar) set the microphone to
-   **Virtual_Mic**. The pulse source is `virtmic` — a real (non-monitor)
-   source backed by the native Audio/Source/Virtual node. If the app had
-   another device selected, re-select it — apps cache input devices.
-4. Click **Тест** in the GUI: a 2 s 440 Hz tone plays and the VU bar
-   ("Виртуальный микрофон") reacts.
-5. Or headless: `soundboard play airhorn`, `soundboard doctor`,
-   `soundboard down` to remove the graph again.
+## Интерфейс
 
-## CLI reference
+Окно — стек из трёх вкладок (переключение в заголовке окна) плюс баннер
+«Граф: проблемы — см. вкладку Дебаг» с кнопкой «Открыть» (появляется при
+сбоях графа).
 
-| Command | What it does |
+### Вкладка «Саундборд» (повседневная)
+
+- сетка кнопок клипов (из папки клипов; играющие подсвечиваются);
+- **Обновить** — пересканировать папку клипов;
+- **Стоп всё** — остановить все воспроизведения, запущенные из этого
+  приложения;
+- слайдер **Громкость** (0–100 %, сохраняется в конфиг);
+- **VU-метр виртуального микрофона** — живой уровень сигнала;
+- подсказка: «выбери Virtual_Mic как микрофон в приложении связи».
+
+### Вкладка «Настройки»
+
+- **Микс с микрофоном** — пропускать настоящий микрофон в виртуальный
+  (по умолчанию включено);
+- **Слышать себя** — дублировать клипы в реальные колонки (выключено по
+  умолчанию);
+- **Перезапускать клип повторным нажатием** — режим прерывания (включено
+  по умолчанию; выключено — повторный клик играет копию поверх).
+  Изменение микса/мониторинга сразу перестраивает граф;
+- секция **Глобальные хоткеи**: таблица клип → клавиша → команда, строка
+  состояния («зарегистрированы» / «не зарегистрированы» / «устарели»),
+  кнопки **Включить хоткеи** / **Обновить хоткеи** и **Выключить**.
+  Запись файлов и активация в Plasma выполняются автоматически
+  (включая `kbuildsycoca6` и принудительное перечитывание
+  kglobalaccel);
+- **Папка клипов** — текущий путь и кнопка «Открыть папку» (xdg-open).
+
+### Вкладка «Дебаг»
+
+- строка статуса графа и кнопки: **Проверить** (doctor), **Починить граф**
+  (reconcile), **Тест** (тон 440 Гц);
+- список проверок doctor с деталями каждой (аргументы модулей, id узлов,
+  имена источников) — тут же видны сырые предупреждения последнего
+  reconcile.
+
+### Трей
+
+- Закрытие окна ([X]) **не** завершает приложение, а прячет окно в трей:
+  граф, VU-метр и клипы, запущенные хоткеями, продолжают работать
+  (всплывает напоминание «Приложение осталось в трее»).
+- Значок в трее (StatusNotifierItem, нативный протокол Plasma): левый клик —
+  показать/скрыть окно; меню — «Показать/Скрыть окно», «Стоп всё»,
+  строка статуса графа («Граф: OK» / «Граф: проблемы») и «Выход».
+- «Выход» (как и SIGINT/SIGTERM) завершает приложение корректно: конфиг
+  сохранён, воспроизведения и метр остановлены, **аудиограф остаётся
+  работать** для приложения связи.
+- Приложение живёт в одном экземпляре (single-instance): повторный запуск
+  `soundboard` не плодит второе окно, а показывает (и разворачивает) уже
+  открытое.
+- Если оболочка не поддерживает трей (нет StatusNotifierWatcher), приложение
+  работает в оконном режиме: закрытие окна означает выход.
+
+## CLI
+
+Без подкоманды запускается GUI. Сообщения — на русском.
+
+| Команда | Что делает |
 |---|---|
-| `soundboard` (no subcommand) | GTK4/libadwaita GUI (three views: «Саундборд» / «Настройки» / «Дебаг»): auto-reconciles the graph at startup, clip grid + VU meter + volume on the board view, toggles + global hotkeys + clips dir on settings, merged doctor checks + repair buttons on debug; leaves the graph running on close. |
-| `soundboard up` | Create or repair the audio graph (idempotent reconcile; prints applied changes). |
-| `soundboard down` | Unload soundboard's modules; foreign modules are never touched. |
-| `soundboard doctor` | Check the graph state; exit code 1 when problems are found. |
-| `soundboard list` | List clips from the configured clips directory. |
-| `soundboard play <name>` | Play a clip (non-blocking; the graph is reconciled first automatically). Names resolve by exact match, then unique case-insensitive/prefix match. |
-| `soundboard stop [name]` | Stop one clip, or everything without a name (works even while the pulse server is down — matches `pw-cat` playbacks via `/proc`). |
-| `soundboard hotkeys [--write]` | Print the clip → `Alt+N` → command table plus manual Plasma 6 steps; `--write` also generates the `.desktop` shortcut files. |
+| `soundboard` | GUI: автоподъём графа при старте, сетка клипов, VU-метр, тумблеры, хоткеи, doctor; закрывается в трей. |
+| `soundboard up` | Создать или починить аудиограф (идемпотентный reconcile); печатает применённые изменения. |
+| `soundboard down` | Выгрузить модули soundboard (чужие модули не трогаются). |
+| `soundboard doctor` | Проверить состояние графа; код выхода 1 — если найдены проблемы. |
+| `soundboard list` | Показать клипы из настроенного каталога. |
+| `soundboard play <имя>` | Проиграть клип (неблокирующе; граф поднимается автоматически). Имя: точное, уникальное без учёта регистра или уникальный префикс (`soundboard play air` → `airhorn`). |
+| `soundboard stop [имя]` | Остановить клип, без имени — всё. Работает даже при недоступном pulse-сервере (ищет `pw-cat` по `/proc`); останавливает и воспроизведения, запущенные из GUI или хоткеями. |
+| `soundboard hotkeys` | Таблица клип → `Alt+N` → команда + инструкция ручной привязки для Plasma 6. |
+| `soundboard hotkeys --write` | Записать `.desktop`-файлы хоткеев и активировать их в работающей Plasma. |
 
-## Configuration
+Примеры:
 
-`~/.config/soundboard/config.toml` (TOML; missing file → defaults, unknown
-keys / malformed values → error):
+```sh
+soundboard up                 # поднять граф без GUI
+soundboard play airhorn       # сыграть клип
+soundboard stop               # остановить всё
+soundboard hotkeys --write    # Alt+1..9 для первых девяти клипов
+soundboard down               # полностью убрать граф
+```
 
-| Key | Default | Meaning |
-|---|---|---|
-| `clips_dir` | `~/Music/soundboard-clips` | Clips directory (leading `~` expanded). |
-| `volume` | `0.9` | Playback volume, `0.0..=1.0` (out-of-range values are clamped). The GUI slider persists here with a short debounce, so hotkey-spawned `soundboard play` plays at the shown level. |
-| `interrupt_mode` | `true` | Re-clicking a clip restarts it; `false` plays overlapping copies. |
-| `mic_mix` | `true` | Pass the real microphone through into the virtual mic. |
-| `monitoring` | `false` | Also route clip audio to the real speakers. |
+## Конфигурация
 
-Ownership is tracked in `$XDG_STATE_HOME/soundboard/modules.json`
-(schema v2: pulse module indices + native node ids, typically
-`~/.local/state/soundboard/modules.json`).
+Файл: `~/.config/soundboard/config.toml` (TOML). Отсутствующий файл —
+значения по умолчанию; некорректный TOML, неизвестные ключи или неверные
+типы — ошибка; `volume` вне диапазона `0.0..=1.0` обрезается в диапазон
+(чтобы старое рукописное значение не мешало запуску), `~` в пути
+раскрывается.
 
-## Tray
+| Поле | Тип | По умолчанию | Что делает |
+|---|---|---|---|
+| `clips_dir` | путь | `~/Music/soundboard-clips` | Каталог клипов (не рекурсивно; скрытые файлы игнорируются; имена-дубликаты — предупреждение, остаётся первый по алфавиту). |
+| `volume` | число `0.0..=1.0` | `0.9` | Громкость воспроизведения (передаётся в `pw-cat --volume`). |
+| `interrupt_mode` | bool | `true` | Повторное нажатие того же клипа перезапускает его; `false` — играет копию поверх. |
+| `mic_mix` | bool | `true` | Пропускать реальный микрофон в виртуальный (через микшерный синк `sbmicmix`). |
+| `monitoring` | bool | `false` | Дублировать клипы в реальные колонки (loopback в синк по умолчанию). |
 
-Closing the window (the [X] button) hides it to the system tray — the app
-keeps running: the PipeWire graph stays up, the VU meter keeps metering and
-hotkey-spawned `soundboard play` processes keep working. A toast reminds
-you the app stayed in the tray. Reopen from the tray menu
-(«Показать/Скрыть окно», or a left click on the icon) or by launching
-`soundboard` again. Real quit only via the tray menu «Выход» (or
-SIGINT/SIGTERM): both go through the graceful shutdown path — config is
-saved, playbacks and meter are stopped, the graph stays up for the
-conferencing app. The tray item requires a StatusNotifierItem-capable shell
-(Plasma provides one); without it the app falls back to windowed mode where
-closing the window quits.
+**Персистенция громкости.** Ползунок в GUI сохраняется в `config.toml` с
+хвостовым дебаунсом ~300 мс (сохранение происходит, когда ползунок «замолчал»
+на это время; при выходе конфиг сохраняется всегда). Это нужно потому, что
+каждый клип, запущенный хоткеем, — это отдельный процесс
+`soundboard play`, который читает громкость из `config.toml`: ползунок и
+хоткеи всегда согласованы.
 
-## Hotkeys
+## Глобальные хоткеи
 
-`soundboard hotkeys` prints the clip → key → command table; the first 9
-clips (sorted) map to `Alt+1`…`Alt+9`. `soundboard hotkeys --write`
-generates idempotent, marker-checked
-`~/.local/share/applications/net.local.soundboard.<slug>.desktop` files
-(`X-KDE-Shortcuts=Alt+N`); foreign files are never touched, overwrites are
-backed up. Activation is automatic: after writing, the running Plasma is
-made to re-read the files (a running kglobalacceld never reloads an
-existing component on its own — a plain `kbuildsycoca6` is not enough; a
-re-login remains the guaranteed fallback). The same management
-lives in the app: **Настройки → «Глобальные хоткеи»** shows the table and
-the registration state (registered / not registered / stale), **Включить /
-Обновить** writes the files and activates them for you, **Выключить**
-removes only soundboard's own files. Details and Plasma internals:
-[`docs/kde-hotkeys.md`](docs/kde-hotkeys.md),
-[ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md).
+- Первым девяти клипам (по алфавиту) назначаются `Alt+1`…`Alt+9`; остальные
+  клипы показываются в таблице как «без горячих клавиш» (лимит — 9).
+- Как это устроено: для каждого клипа пишется самодостаточный файл
+  `~/.local/share/applications/net.local.soundboard.<slug>.desktop` с
+  `X-KDE-Shortcuts=Alt+N` (клавиша по умолчанию) и
+  `Exec="/абсолютный/путь/soundboard" play "<клип>"`. Конфиг Plasma
+  `~/.config/kglobalshortcutsrc` программа никогда не правит — его живёт и
+  переписывает сам демон хоткеев.
+- Активация автоматическая: после записи выполняется `kbuildsycoca6`, а
+  чтобы **работающая** Plasma перечитала файлы, делается «танец»
+  скрыть/вернуть файлы с опросом демона через D-Bus
+  (`org.kde.KGlobalAccel.allComponents`). Причина: kglobalaccel читает
+  `Exec` компонента только один раз и при перезаписи существующего файла
+  держит устаревший путь (ловушка stale Exec — хоткей срабатывает, но запуск
+  падает «Невозможно найти программу…»). Если демона нет (не Plasma-сессия),
+  остаётся только `kbuildsycoca6`.
+- Гарантированный запасной вариант активации — выйти из сессии и зайти
+  снова. Ручная привязка в обход всего этого: Параметры системы → Клавиатура
+  → Комбинации клавиш → «Добавить» → «Команда или сценарий…» (команды — в
+  таблице `soundboard hotkeys`).
+- Безопасность: файлы помечены маркером генератора; чужой файл с тем же
+  именем никогда не трогается; перед перезаписью делается резервная копия
+  (`*.bak.<метка времени>`); повторный запуск `--write` идемпотентен.
+  «Выключить» в GUI (или удаление файлов) снимает только файлы soundboard.
+- Подробное исследование механики хоткеев Plasma 6:
+  [`docs/kde-hotkeys.md`](docs/kde-hotkeys.md), решение —
+  [ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md).
 
-## Manual e2e checklist
+## Форматы аудио
 
-Verified once per release on the real desktop session:
+Расширения, которые программа считает клипами (без учёта регистра):
+`wav`, `mp3`, `ogg`, `oga`, `flac`, `opus`, `m4a`. Декодирует сам `pw-cat`,
+проверено вживую на этой машине (воспроизведение в граф, замер пика
+захвата):
 
-1. `soundboard` starts; the graph comes up automatically, summary shows
-   «Граф: OK».
-2. `soundboard doctor` is all green («все проверки пройдены»), exit code 0.
-3. The VU bar reacts to the «Тест» button (440 Hz) and to clips.
-4. Clicking a clip is audible in the call with microphone = Virtual_Mic.
-5. Interrupt/overlap: re-clicking the same clip restarts it
-   (`interrupt_mode` on), different clips play over each other; turning the
-   «Перезапускать клип повторным нажатием» toggle off switches to copies.
-6. «Стоп всё» stops every GUI playback.
-7. Toggles behave: «Микс с микрофоном» passes the real mic into the virtual
-   mic, «Слышать себя» duplicates clips to the speakers; both reconcile the
-   graph immediately.
-8. Ctrl+C (or closing the window) exits gracefully — config saved,
-   playbacks and meter stopped, **the graph stays up** for the conferencing
-   app.
-9. `soundboard hotkeys --write` + `kbuildsycoca6` (or **Настройки →
-   «Включить хоткеи»** in the app), then `Alt+1` plays the first clip
-   (sorted) even with another window focused.
+| Формат | Расширение | Проверено | Замер |
+|---|---|---|---|
+| WAV PCM | `wav` | да | пик 0.500 FS — точно совпал с исходником |
+| MP3 | `mp3` | да | декодируется (обычная «рябь» кодека) |
+| Ogg Vorbis | `ogg`, `oga` | да | декодируется (рябь кодека) |
+| FLAC | `flac` | да | декодируется (пик точный) |
+| Opus, AAC | `opus`, `m4a` | не проверялись вживую | принимаются сканером; `pw-cat` обычно их играет |
 
-## Troubleshooting
+Детали и методика: [`docs/pipewire-recipe.md`](docs/pipewire-recipe.md).
 
-- **Virtual mic is silent in the call**: run `soundboard doctor` — fix
-  whatever fails (or press «Починить граф» / run `soundboard up`), then
-  re-select "Virtual_Mic" in the app's audio settings; apps cache the
-  previously chosen device. **If Virtual_Mic is missing from the app's mic
-  list entirely**: run `soundboard doctor` and re-open the app's audio
-  settings after the graph is green (apps usually rescan devices only when
-  their settings are reopened).
-- **No signal although the graph is green**: probe the source directly with
-  `cargo run --example vu_probe --` (defaults to `virtmic`, prints
-  ~10 peak levels/second, Ctrl+C to stop). Peaks while playing → capture
-  side is fine, check the conferencing app. Flat → check
-  `pactl list sink-inputs` while playing.
-- **Foreign loopbacks**: soundboard unloads only modules recorded in its
-  state file — a lookalike module it never loaded is left alone with a
-  warning. If you lost the state file while the graph was up, run
-  `soundboard up` once (it adopts the exact-args modules back into the
-  state), then `soundboard down` works again.
-- **The graph survives app close by design** (the conferencing app keeps
-  its device); `soundboard down` removes it completely — including the
-  native node (`pw-cli destroy`; a pipewire daemon restart also removes it,
-  `up` recreates everything).
-- **Do NOT hand-roll the virtual mic** with pulse-level
-  `media.class=Audio/Source/Virtual` null-sinks or `pw-loopback` — both are
-  live-tested broken on PipeWire 1.6.9 (silently re-targeted to the default
-  sink). Use `soundboard up`; the details are in
+## Устранение неполадок
+
+- **Гул микрофона при включённом миксе.** Признак самопетли: виртуальный
+  микрофон замкнут сам на себя (`virtmic -> virtmic`) — уровень уходит в
+  цифровое насыщение. Нажмите **Починить граф** (или `soundboard up`):
+  reconciler уничтожает самопетли, а текущая топология микса вообще не
+  создаёт прямых связей микрофона в `virtmic` — микрофон идёт через
+  микшерный синк `sbmicmix`
+  ([ADR 0005](docs/adr/0005-mic-mix-via-mixer-sink.md)). Проверка
+  «на virtmic нет самопетли» есть в doctor.
+- **Virtual_Mic пропал из списка микрофонов приложения.** Запустите
+  `soundboard doctor` (или откройте «Дебаг»), дождитесь «все проверки
+  пройдены», затем заново откройте настройки звука в приложении связи и
+  выберите Virtual_Mic — приложения перечитывают список устройств при
+  открытии настроек и кэшируют ранее выбранный вход.
+- **Хоткеи не срабатывают.** Проверьте: `soundboard hotkeys` (таблица и
+  состояние), `soundboard hotkeys --write` (переписать и активировать заново),
+  затем Параметры системы → Клавиатура → Комбинации клавиш → раздел
+  «Команды». Если после перезаписи путей к бинарнику клавиши «стреляют», но
+  ничего не происходит — это ловушка stale Exec; повторный `--write` делает
+  принудительное перечитывание, в крайнем случае перелогиньтесь. Диагностика:
+  `journalctl --user | grep "Невозможно найти программу"`.
+- **Звук клипов слышен в колонках.** Включён тумблер «Слышать себя» — это и
+  есть локальный мониторинг, выключите его в «Настройках».
+- **Клап/эхо в звонке.** Физика: колонки слышит настоящий микрофон
+  (мониторинг тут ни при чём). Уменьшите громкость колонок, отодвиньте
+  микрофон или используйте наушники.
+- **Граф пропал после перезапуска PipeWire.** Нативный узел и связи живут
+  в сессии демона и умирают вместе с ним. `soundboard up` (или перезапуск
+  GUI) пересобирает всё заново.
+- **Нет сигнала, хотя граф «зелёный».** Проверьте источник напрямую:
+  `cargo run --example vu_probe --` (по умолчанию слушает `virtmic`,
+  печатает ~10 уровней в секунду, Ctrl+C — выход). Пики есть при
+  воспроизведении — проблема на стороне приложения связи; пиков нет —
+  смотрите `pactl list sink-inputs` во время воспроизведения.
+- **Осторожно с ручной сборкой виртуального микрофона.** Варианты «своими
+  руками» через pulse-слой (`module-null-sink media.class=Audio/Source/Virtual`
+  или `pw-loopback`) проверено сломаны (тихо перецеливаются в синк по
+  умолчанию). Используйте `soundboard up`; разбор — в
   [`docs/pipewire-recipe.md`](docs/pipewire-recipe.md).
 
-## Development
+## Ограничения
 
-```bash
-just build   # cargo build
-just test    # cargo test
-just lint    # cargo fmt --check + clippy -D warnings
-just run     # cargo run (GUI)
+- Глобальных хоткеев ровно 9 (`Alt+1`…`Alt+9`) — только для первых девяти
+  клипов по алфавиту.
+- Приложения связи кэшируют выбранное устройство: после пересборки графа
+  Virtual_Mic нужно перевыбрать (или заново открыть настройки звука).
+- Нативный узел `virtmic` не переживает рестарт демона PipeWire — лечится
+  `soundboard up` (GUI делает это сам при запуске).
+- При включённом «Микс с микрофоном» реальный микрофон не «засыпает»
+  (loopback держит поток захвата) — небольшой расход энергии в простое.
+- «Стоп всё» в GUI и трее останавливает только воспроизведения, запущенные
+  этим приложением; `soundboard stop` из CLI останавливает всё, что играет
+  в целевой синк, включая запуски других процессов.
+
+## Разработка
+
+```sh
+just build           # cargo build
+just test            # cargo test
+just lint            # cargo fmt --check + clippy -D warnings
+just run             # cargo run (GUI)
+just clips-install   # клипы из репозитория в ~/Music/soundboard-clips
 ```
 
-- Toolchains come via mise only; never install system packages.
-- Layout: `src/main.rs` (entry, dispatch), `src/cli.rs`, `src/graph.rs`,
-  `src/player.rs`, `src/scheduler.rs`, `src/clips.rs`, `src/config.rs`,
-  `src/meter.rs`, `src/hotkeys.rs`, `src/ui/` (window + audio worker),
-  `examples/vu_probe.rs` (standalone peak probe). See `AGENTS.md` for the
-  full map and project rules.
-- Documentation: `docs/pipewire-recipe.md` (audio contract),
-  `docs/kde-hotkeys.md` (Plasma research), `docs/hld.md` (architecture,
-  keep in sync with the code), `docs/adr/` — architecture decision records,
-  append-only (Context → Decision → Alternatives → Consequences; a revised
-  decision is a new ADR, numbering is never reused).
-- Conventional commits; never `git push` from an agent session.
+- Тулчейн — только через mise (`mise.toml` закрепляет `stable`); системные
+  пакеты не ставим.
+- Отладочный пример: `cargo run --example vu_probe -- [источник]` — живой
+  пик-пробник произвольного pulse-источника (по умолчанию `virtmic`).
+- Раскладка `src/`: `main.rs` (точка входа, диспетчер CLI), `cli.rs`
+  (определения команд), `graph.rs` (reconcile графа в два слоя + doctor +
+  state-файл), `player.rs` (процессы `pw-cat`, межпроцессная остановка),
+  `scheduler.rs` (политика прерываний), `clips.rs` (реестр клипов),
+  `config.rs` (конфиг), `meter.rs` (VU-метр), `hotkeys.rs`
+  (.desktop-файлы хоткеев), `ui/` (окно, аудио-воркер, трей, живое
+  обновление kglobalaccel). Полная карта и правила проекта — `AGENTS.md`.
+- Документация: `docs/pipewire-recipe.md` (контракт аудиографа),
+  `docs/kde-hotkeys.md` (исследование хоткеев Plasma),
+  `docs/hld.md` (архитектура), `docs/adr/` — архитектурные решения
+  (дополняются, не переписываются: Контекст → Решение → Альтернативы →
+  Последствия).
+- Коммиты — conventional (`feat:`, `fix:`, `docs:`, …).
+
+## Как это устроено внутри
+
+Коротко; полные детали — в [`docs/hld.md`](docs/hld.md) и
+[`docs/pipewire-recipe.md`](docs/pipewire-recipe.md).
+
+- **Почему нативный узел.** Приложения связи (проверено на Zoom)
+  **фильтруют** монитор-источники из списков микрофонов. Старая схема
+  «null-sink + захват его монитора `virtmic.monitor`» давала источник,
+  которого приложения просто не показывали. Нативный узел
+  `Audio/Source/Virtual`, созданный `pw-cli create-node adapter`,
+  pipewire-pulse отдаёт как **настоящий** источник `virtmic` (не монитор,
+  флаг HARDWARE) — его приложения показывают и пишут. По этой же причине не
+  работает pulse-вариант `module-null-sink media.class=Audio/Source/Virtual`
+  (не регистрирует pulse-синк; loopback-ы молча падают в синк по умолчанию)
+  и `pw-loopback` (неверно привязывает обе стороны). Разбор битых вариантов —
+  в рецепте и [ADR 0004](docs/adr/0004-virtmic-native-source-node.md).
+- **Реальный микрофон** для микса выбирается чистой функцией: кандидаты —
+  все pulse-источники, кроме `virtmic` и мониторов; приоритет — источник по
+  умолчанию, иначе первый `alsa_input.*`; никого — mic-путь пропускается с
+  предупреждением, doctor падает с внятным сообщением. Прямые связи
+  `<мик>:capture_* -> virtmic:input_*` никогда не создаются (проверенные
+  ловушки: ENOENT у спящего ALSA-микрофона и самопетля, когда источником по
+  умолчанию назначен сам `virtmic`).
+- **State-файл владения**
+  (`~/.local/state/soundboard/modules.json`, схема v2) — единственный
+  источник истины о том, что в pulse-сессии создано soundboard:
+  индексы и ожидаемые имена модулей плюс id/имена нативных узлов.
+  Модуль считается «нашим», только если он в файле, существует и имеет
+  ожидаемую форму; всё остальное — чужое и не выгружается. Порванный или
+  устаревший файл читается как пустое состояние и восстанавливается
+  «усыновлением» на следующем `up`.
+- **doctor** проверяет граф с обеих сторон (pulse — через libpulse,
+  нативная — через `pw-cli`/`pw-link`): сервер, синк `soundboard`, источник
+  `virtmic` и его «не-мониторность», единственность узла, наличие связей,
+  отсутствие самопетли, реальный микрофон, цепочка микса (при `mic_mix`),
+  monitoring loopback (при `monitoring`). Часть проверок помечается
+  «пропущено», если pulse-сервер недоступен.

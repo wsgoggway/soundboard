@@ -1,55 +1,55 @@
-# soundboard — High-Level Design
+# soundboard — высокоуровневый дизайн (HLD)
 
-A Rust + GTK4 soundboard that creates a PipeWire virtual microphone and
-plays short audio clips into it, for conferencing apps (Zoom, Google Meet,
-Telegram, Jitsi, …) on Linux. The audio topology is the live-verified
-contract in
-[`docs/pipewire-recipe.md`](pipewire-recipe.md); this document maps that
-contract onto the code. Keep it in sync with the code in the same commit.
+Саундборд на Rust + GTK4, создающий в PipeWire виртуальный микрофон и
+проигрывающий в него короткие аудиоклипы, для приложений связи (Zoom,
+Google Meet, Telegram, Jitsi, …) на Linux. Аудиотопология — живьём
+проверенный контракт в [`docs/pipewire-recipe.md`](pipewire-recipe.md);
+этот документ привязывает контракт к коду. Держать в актуальном состоянии в
+одном коммите с кодом.
 
-## Components
+## Компоненты
 
-| Component | Code | Responsibility |
+| Компонент | Код | Ответственность |
 |---|---|---|
-| CLI | `src/main.rs`, `src/cli.rs` | Subcommands `up`/`down`/`doctor`/`list`/`play`/`stop`/`hotkeys`; no subcommand launches the GUI. Loads config, prints reports. |
-| Tray | `src/ui/tray.rs` | StatusNotifierItem via ksni 0.3 (blocking): icon, tooltip and Russian menu on its own thread; menu actions send `TrayCmd`s to the GTK main loop (toggle window, stop all, graceful quit); graph-status line updated from `GuiMsg::Status`. Close-to-tray: the window hides, the app (graph + meter + hotkey plays) keeps running. |
-| Hotkey live refresh | `src/ui/kglobalaccel.rs` | Session glue: after the hotkey desktop files are rewritten, makes a running kglobalacceld re-read them (hide/restore + two `kbuildsycoca6` runs, `gdbus allComponents` polling); used by CLI `--write` and the GUI register flow. |
-| GUI | `src/ui/window.rs`, `src/ui/mod.rs` | libadwaita window: doctor status rows, repair/test/stop buttons, VU `LevelBar`, clip grid (FlowBox), volume slider, mic-mix/monitoring/interrupt toggles, error toasts. Sends commands only — nothing blocking on the UI thread. |
-| Audio worker | `src/ui/worker.rs` | One thread owning all blocking audio: pulse session, graph, player, scheduler, meter. Auto-reconciles + runs doctor at startup; restarts the meter on every successful reconcile; persists config; stops playbacks on shutdown while deliberately leaving the graph up. |
-| Graph manager | `src/graph.rs` | Idempotent desired-state reconcile over TWO layers: pulse null-sinks + loopbacks (libpulse: memes sink, mic-mix mixer sink `sbmicmix` + mic loopback, monitoring loopback), and the native `Audio/Source/Virtual` node `virtmic` + `pw-link` feeds (`pw-cli`/`pw-link` subprocesses); module/node ownership state file; `doctor` checks; foreign modules and links are never touched. |
-| Player | `src/player.rs` | One `pw-cat --playback --target soundboard` subprocess per clip (own process group, SIGTERM→SIGKILL stop); cross-process stop by scanning `/proc/*/cmdline`. |
-| Scheduler | `src/scheduler.rs` | Pure playback policy: per-clip interrupt vs. overlap, stop-one/stop-all decisions over opaque handles. |
-| Meter | `src/meter.rs` | Peak meter capturing `virtmic` (the native virtual source) on its own thread (~30 Hz, throttled) into an async channel for the UI. |
-| Clips registry | `src/clips.rs` | Non-recursive scan of the clips directory (wav/mp3/ogg/oga/flac/opus/m4a, case-insensitive); name resolution: exact, then unique case-insensitive/prefix. |
-| Hotkeys | `src/hotkeys.rs` | Clip → `Alt+N` → command table; `--write` generates KDE `.desktop` shortcut files (see [ADR 0002](adr/0002-kde-hotkeys-via-desktop-files.md)). |
-| Config | `src/config.rs` | TOML at `~/.config/soundboard/config.toml`; defaults when missing, error on malformed, volume clamped. |
-| Module state | `$XDG_STATE_HOME/soundboard/modules.json` | Persistent registry of the pulse module indices and native node ids soundboard created (schema v2); `down` unloads/destroys only these plus name/pair-matched native objects (see `src/graph.rs` docs). |
+| CLI | `src/main.rs`, `src/cli.rs` | Подкоманды `up`/`down`/`doctor`/`list`/`play`/`stop`/`hotkeys`; без подкоманды — GUI. Загружает конфиг, печатает отчёты. |
+| Трей | `src/ui/tray.rs` | StatusNotifierItem через ksni 0.3 (blocking): значок, подсказка и русское меню в своём потоке; действия меню шлют `TrayCmd` в главный цикл GTK (показать/скрыть окно, стоп всё, корректный выход); строка статуса графа обновляется из `GuiMsg::Status`. Закрытие окна прячет его в трей, приложение (граф + метр + клипы по хоткеям) продолжает работать. |
+| Живое обновление хоткеев | `src/ui/kglobalaccel.rs` | Клей сессии: после перезаписи `.desktop`-файлов хоткеев заставляет работающий kglobalacceld перечитать их (скрыть/вернуть + два `kbuildsycoca6`, опрос `gdbus allComponents`); используется и CLI `--write`, и регистрацией в GUI. |
+| GUI | `src/ui/window.rs`, `src/ui/mod.rs` | Окно libadwaita: строки проверок doctor, кнопки починки/теста/стопа, VU `LevelBar`, сетка клипов (FlowBox), слайдер громкости, тумблеры микс/мониторинг/прерывание, тосты об ошибках. Только шлёт команды — ничего блокирующего в потоке UI. |
+| Аудио-воркер | `src/ui/worker.rs` | Один поток, владеющий всем блокирующим аудио: pulse-сессия, граф, плеер, планировщик, метр. При старте сам делает reconcile + doctor; перезапускает метр после каждого успешного reconcile; сохраняет конфиг; на выключении останавливает воспроизведения, сознательно оставляя граф работать. |
+| Менеджер графа | `src/graph.rs` | Идемпотентное приведение желаемого состояния к сессии в ДВУХ слоях: pulse null-sink + loopback (libpulse: клип-синк, микшерный синк `sbmicmix` + mic-loopback, monitoring loopback) и нативный узел `virtmic` (`Audio/Source/Virtual`) + связи через `pw-link` (подпроцессы `pw-cli`/`pw-link`); state-файл владения модулями/узлами; проверки `doctor`; чужие модули и связи не трогаются. |
+| Плеер | `src/player.rs` | Один подпроцесс `pw-cat --playback --target soundboard` на клип (своя группа процессов, остановка SIGTERM→SIGKILL); межпроцессный останов сканом `/proc/*/cmdline`. |
+| Планировщик | `src/scheduler.rs` | Чистая политика воспроизведения: пер-клиповое прерывание против наложения, решения stop-one/stop-all над непрозрачными хэндлами. |
+| Метр | `src/meter.rs` | Пик-метр, захватывающий `virtmic` (нативный виртуальный источник) в своём потоке (~30 Гц, с троттлингом) в async-канал для UI. |
+| Реестр клипов | `src/clips.rs` | Нерекурсивный скан каталога клипов (wav/mp3/ogg/oga/flac/opus/m4a, без учёта регистра); разрешение имени: точное, затем уникальное без учёта регистра/по префиксу. |
+| Хоткеи | `src/hotkeys.rs` | Таблица клип → `Alt+N` → команда; `--write` генерирует KDE `.desktop`-файлы (см. [ADR 0002](adr/0002-kde-hotkeys-via-desktop-files.md)). |
+| Конфиг | `src/config.rs` | TOML в `~/.config/soundboard/config.toml`; отсутствие файла — дефолты, битый файл — ошибка, volume обрезается. |
+| State модулей | `$XDG_STATE_HOME/soundboard/modules.json` | Постоянный реестр индексов pulse-модулей и id нативных узлов, созданных soundboard (схема v2); `down` выгружает/уничтожает только их плюс нативные объекты, найденные по имени/паре портов (см. доки `src/graph.rs`). |
 
-## Audio topology (verified)
+## Аудиотопология (проверено)
 
-The graph from [`docs/pipewire-recipe.md`](pipewire-recipe.md): the clips
-sink `soundboard` (pulse), the NATIVE virtual source node `virtmic`
-(`Audio/Source/Virtual`, description "Virtual_Mic") fed by `pw-link` port
-pairs, and two optional passthroughs: the mic-mix chain (`mic_mix`, ADR
-0005 — real mic → pulse module-loopback → mixer sink `sbmicmix` → native
-monitor links into the same virtmic inputs) and the pulse monitoring
-loopback to the real speakers. The conferencing app captures the pulse
-source `virtmic` — a real source, NOT a monitor (such apps filter monitor
-sources; that is why the native node exists, ADR 0004). The GUI meter
-captures the same source.
+Граф из [`docs/pipewire-recipe.md`](pipewire-recipe.md): клип-синк
+`soundboard` (pulse), НАТИВНЫЙ узел виртуального источника `virtmic`
+(`Audio/Source/Virtual`, описание «Virtual_Mic»), питаемый парами портов
+через `pw-link`, и два опциональных прохода: цепочка микса (`mic_mix`,
+ADR 0005 — реальный микрофон → pulse module-loopback → микшерный синк
+`sbmicmix` → нативные связи монитора в те же входы `virtmic`) и pulse
+monitoring loopback в реальные колонки. Приложение связи захватывает
+pulse-источник `virtmic` — реальный источник, НЕ монитор (такие приложения
+фильтруют мониторы; именно поэтому существует нативный узел, ADR 0004).
+Метр GUI захватывает тот же источник.
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 flowchart LR
-    CLIPS["Clips<br/>~/Music/soundboard-clips"]
-    SB["sink soundboard<br/>Meme_Soundboard (pulse)"]
-    MIC["real mic<br/>resolved source (never virtmic)"]
-    SBM["sink sbmicmix<br/>SB_MicMix (pulse)"]
-    VM["node virtmic<br/>Audio/Source/Virtual (native)"]
-    RS["real sink<br/>default sink"]
-    LB["monitoring loopback<br/>pulse"]
-    CONF["conferencing app<br/>microphone = Virtual_Mic"]
-    VU["VU meter<br/>GUI and vu_probe"]
+    CLIPS["Клипы<br/>~/Music/soundboard-clips"]
+    SB["синк soundboard<br/>Meme_Soundboard (pulse)"]
+    MIC["реальный микрофон<br/>определённый источник (не virtmic)"]
+    SBM["синк sbmicmix<br/>SB_MicMix (pulse)"]
+    VM["узел virtmic<br/>Audio/Source/Virtual (нативный)"]
+    RS["реальные колонки<br/>синк по умолчанию"]
+    LB["monitoring loopback<br/>(pulse)"]
+    CONF["приложение связи<br/>микрофон = Virtual_Mic"]
+    VU["VU-метр<br/>GUI и vu_probe"]
 
     CLIPS -->|"pw-cat"| SB
     SB -->|"pw-link monitor_FL/FR"| VM
@@ -57,67 +57,68 @@ flowchart LR
     SBM -.->|"pw-link monitor_FL/FR"| VM
     SB -.->|"module-loopback (monitoring)"| LB
     LB --> RS
-    VM -->|"pulse source virtmic"| CONF
-    VM -->|"meter captures"| VU
+    VM -->|"pulse-источник virtmic"| CONF
+    VM -->|"съём сигнала"| VU
 ```
 
-Solid edges are the always-on path; dotted edges exist only while the
-`mic_mix` / `monitoring` config flags are on. The mic-mix loopback is
-re-targeted when the resolved real mic changes (default source if usable,
-else the first `alsa_input.*`; never `virtmic` or a monitor — ADR 0005),
-the monitoring loopback follows the default sink. Links into `virtmic` are
-mixed by the adapter's soft-mixer.
+Сплошные рёбра — постоянный путь; пунктирные существуют только при
+включённых `mic_mix` / `monitoring`. mic-mix loopback перецеливается при
+смене определённого реального микрофона (источник по умолчанию, если
+пригоден, иначе первый `alsa_input.*`; никогда `virtmic` или монитор —
+ADR 0005), monitoring loopback следует за синком по умолчанию. Связи в
+`virtmic` смешиваются софт-микшером адаптера.
 
-Deliberately NOT used (live-tested broken variants, see the recipe): the
-pulse-level `module-null-sink media.class=Audio/Source/Virtual` (no pulse
-sink registered; loopbacks fall back to the default sink) and
-`pw-loopback` (mis-binds both halves). The native pw-cli node is the
-verified replacement ([ADR 0004](adr/0004-virtmic-native-source-node.md)).
+Сознательно НЕ используется (проверенные живьём битые варианты, см.
+рецепт): pulse-овый `module-null-sink media.class=Audio/Source/Virtual`
+(не регистрирует pulse-синк; loopback-ы падают в синк по умолчанию) и
+`pw-loopback` (неверно привязывает обе стороны). Нативный pw-cli узел —
+проверенная замена ([ADR 0004](adr/0004-virtmic-native-source-node.md)).
 
-## Configuration surface
+## Конфигурационная поверхность
 
-Config, module state and generated hotkey files are plain files the app
-reads and writes around the audio session:
+Конфиг, state модулей и сгенерированные файлы хоткеев — обычные файлы,
+которые приложение читает и пишет вокруг аудиосессии:
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 flowchart LR
-    CFG["config.toml<br/>~/.config/soundboard"] -->|"behavior flags"| APP["soundboard<br/>CLI and GUI"]
-    STATE["modules.json<br/>XDG state dir"] -->|"owned indices"| APP
-    DESK["net.local.soundboard.*.desktop<br/>~/.local/share/applications"] -->|"kglobalaccel launches"| APP
-    APP -->|"load and unload"| PW["PipeWire session<br/>via pipewire-pulse"]
+    CFG["config.toml<br/>~/.config/soundboard"] -->|"флаги поведения"| APP["soundboard<br/>CLI и GUI"]
+    STATE["modules.json<br/>каталог состояния XDG"] -->|"наши индексы"| APP
+    DESK["net.local.soundboard.*.desktop<br/>~/.local/share/applications"] -->|"kglobalaccel запускает"| APP
+    APP -->|"загрузка и выгрузка"| PW["сессия PipeWire<br/>через pipewire-pulse"]
 ```
 
-- `config.toml`: `clips_dir` (`~/Music/soundboard-clips`), `volume` (0.9,
-  clamped to 0.0..=1.0), `interrupt_mode` (true), `mic_mix` (true),
-  `monitoring` (false). Missing file → defaults; malformed → error.
-- `modules.json`: schema v2 — pulse module indices + expected names and
-  native node ids + names; written after every reconcile/teardown; a
-  missing/corrupt/older-version file is treated as empty and recovered by
-  adoption on the next `up` (pulse: exact args; native: `node.name` /
-  port pairs).
-- `net.local.soundboard.*.desktop`: written only by `soundboard hotkeys
-  --write`; marker-checked, backed up, idempotent
+- `config.toml`: `clips_dir` (`~/Music/soundboard-clips`), `volume`
+  (0.9, обрезается в 0.0..=1.0), `interrupt_mode` (true), `mic_mix` (true),
+  `monitoring` (false). Нет файла → дефолты; битый → ошибка.
+- `modules.json`: схема v2 — индексы pulse-модулей + ожидаемые имена и
+  id/имена нативных узлов; пишется после каждого reconcile/teardown;
+  отсутствующий/битый/устаревший файл читается как пустое состояние и
+  восстанавливается усыновлением на следующем `up` (pulse: точные аргументы;
+  натив: `node.name` / пары портов).
+- `net.local.soundboard.*.desktop`: пишутся только `soundboard hotkeys
+  --write`; с маркером-проверкой, с бэкапами, идемпотентно
   ([ADR 0002](adr/0002-kde-hotkeys-via-desktop-files.md)).
 
-## Key flows
+## Ключевые потоки
 
-- **Startup (GUI)**: worker reconcile → doctor report + meter start →
-  `GuiMsg::GraphUp`/`Status`; the grid is rebuilt on every report, so new
-  clip files appear without a manual rescan.
-- **Play (CLI)**: scan clips → resolve name → reconcile graph (auto-setup;
-  doctor dump on failure) → per-clip interrupt via `/proc` when
-  `interrupt_mode` → spawn `pw-cat`, exit.
-- **Play (GUI)**: worker resolves + schedules → interrupted handles stopped
-  first → `pw-cat` spawned → playing set published to highlight the grid.
-- **Shutdown (GUI)**: close request (also routed from SIGINT/SIGTERM) →
-  worker persists config, stops meter + playbacks → window destroyed; the
-  audio graph stays up for the conferencing app. `soundboard down` is the
-  explicit teardown.
+- **Запуск (GUI)**: воркер делает reconcile → отчёт doctor + запуск метра →
+  `GuiMsg::GraphUp`/`Status`; сетка перестраивается по каждому отчёту, новые
+  файлы клипов появляются без ручного пересканирования.
+- **Play (CLI)**: скан клипов → разрешение имени → reconcile графа
+  (автонастройка; при неудаче — дамп doctor) → пер-клиповое прерывание через
+  `/proc` при `interrupt_mode` → запуск `pw-cat`, выход.
+- **Play (GUI)**: воркер разрешает + планирует → прерванные хэндлы
+  останавливаются первыми → запускается `pw-cat` → множество играющих
+  публикуется, сетка подсвечивается.
+- **Выключение (GUI)**: запрос закрытия (также от SIGINT/SIGTERM) → воркер
+  сохраняет конфиг, останавливает метр + воспроизведения → окно
+  уничтожается; аудиограф остаётся работать для приложения связи.
+  `soundboard down` — явная разборка.
 
-## Decision records
+## Записи решений
 
-Architecture decisions live in [`docs/adr/`](adr/) (append-only):
-0001 pw-cat player process model · 0002 KDE hotkeys via desktop files ·
-0003 GUI toolkit GTK4 · 0004 virtmic as a native Audio/Source/Virtual node ·
-0005 mic-mix via the sbmicmix mixer sink.
+Архитектурные решения лежат в [`docs/adr/`](adr/) (только дополнение):
+0001 процессная модель плеера pw-cat · 0002 хоткеи KDE через desktop-файлы ·
+0003 GUI-тулкит GTK4 · 0004 virtmic как нативный узел
+Audio/Source/Virtual · 0005 mic-mix через микшерный синк sbmicmix.
