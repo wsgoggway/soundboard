@@ -23,7 +23,9 @@ use std::rc::Rc;
 use async_channel::Receiver;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, FlowBox, Frame, Image, Label, LevelBar, Orientation, Scale};
+use gtk4::{
+    Box as GtkBox, Button, FlowBox, Frame, Image, Label, LevelBar, Notebook, Orientation, Scale,
+};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
@@ -225,7 +227,12 @@ pub(crate) fn build(
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
 
-    // Status section: summary line + one row per doctor check.
+    // Status section: summary line + a two-tab notebook. Tab «Статус» holds
+    // only the per-check rows (icon + name) so the main view stays compact;
+    // tab «Подробности» holds the raw per-check detail lines (module args,
+    // node ids, alsa names) verbatim. A plain `gtk::Notebook` is used
+    // deliberately: it styles fine inside libadwaita windows, unlike a
+    // custom expander it keeps both views reachable in one click.
     let summary = Label::builder()
         .label("Автопроверка при запуске…")
         .halign(gtk4::Align::Start)
@@ -240,6 +247,19 @@ pub(crate) fn build(
         .sensitive(false)
         .build();
     checks.append(&placeholder_checks);
+    let details = GtkBox::new(Orientation::Vertical, 6);
+    let details_frame = Frame::new(None);
+    details_frame.set_child(Some(&details));
+    let placeholder_details = Label::builder()
+        .label("Ожидание подробностей проверки…")
+        .halign(gtk4::Align::Start)
+        .sensitive(false)
+        .build();
+    details.append(&placeholder_details);
+    let notebook = Notebook::new();
+    notebook.set_hexpand(true);
+    notebook.append_page(&checks_frame, Some(&Label::new(Some("Статус"))));
+    notebook.append_page(&details_frame, Some(&Label::new(Some("Подробности"))));
 
     // Action buttons.
     let buttons = GtkBox::new(Orientation::Horizontal, 8);
@@ -327,7 +347,7 @@ pub(crate) fn build(
     content.set_margin_start(12);
     content.set_margin_end(12);
     content.append(&summary);
-    content.append(&checks_frame);
+    content.append(&notebook);
     content.append(&buttons);
     content.append(&meter_caption);
     content.append(&level_bar);
@@ -426,7 +446,12 @@ pub(crate) fn build(
     // Both Status and GraphUp refresh the clip grid: new files become
     // buttons without a manual rescan, and the very first doctor report
     // (which arrives even when the startup reconcile failed) builds it.
-    let (summary_rx, checks_rx, window_rx) = (summary.clone(), checks.clone(), window.clone());
+    let (summary_rx, checks_rx, details_rx, window_rx) = (
+        summary.clone(),
+        checks.clone(),
+        details.clone(),
+        window.clone(),
+    );
     let grid_rx = grid.clone();
     let worker_rx = worker.clone();
     let cfg_rx = cfg.clone();
@@ -435,12 +460,16 @@ pub(crate) fn build(
         while let Ok(msg) = ui_rx.recv().await {
             match msg {
                 GuiMsg::Status(report) => {
+                    // A fresh report replaces the summary unconditionally, so
+                    // an earlier error line (e.g. a failed meter start) is
+                    // cleared as soon as a later status is all-pass.
                     set_summary(
                         &summary_rx,
                         doctor_summary_line(&report),
                         Some(report.all_passed()),
                     );
                     rebuild_check_rows(&checks_rx, &report);
+                    rebuild_detail_rows(&details_rx, &report);
                     grid_rx.reload(&lock_config(&cfg_rx), &worker_rx);
                 }
                 GuiMsg::GraphUp(report) => {
@@ -544,7 +573,8 @@ fn set_summary(label: &Label, text: &str, ok: Option<bool>) {
     }
 }
 
-/// Rebuilds the per-check status rows: icon (green/red) + name + detail.
+/// Rebuilds the per-check status rows of the «Статус» tab: icon (green/red)
+/// + check name only — the raw details live on the «Подробности» tab.
 fn rebuild_check_rows(checks: &GtkBox, report: &DoctorReport) {
     while let Some(child) = checks.first_child() {
         checks.remove(&child);
@@ -559,10 +589,34 @@ fn rebuild_check_rows(checks: &GtkBox, report: &DoctorReport) {
             .halign(gtk4::Align::Start)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
+        let row = GtkBox::new(Orientation::Horizontal, 6);
+        row.set_margin_start(8);
+        row.set_margin_end(8);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        row.append(&icon);
+        row.append(&name);
+        checks.append(&row);
+    }
+}
+
+/// Rebuilds the «Подробности» tab: one wrapped row per check — the check
+/// name plus its raw detail line verbatim (module args, node ids, alsa
+/// names), so nothing is hidden behind an ellipsis here.
+fn rebuild_detail_rows(details: &GtkBox, report: &DoctorReport) {
+    while let Some(child) = details.first_child() {
+        details.remove(&child);
+    }
+    for check in &report.checks {
+        let name = Label::builder()
+            .label(&check.name)
+            .halign(gtk4::Align::Start)
+            .build();
         let detail = Label::builder()
             .label(&check.detail)
             .halign(gtk4::Align::Start)
-            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .wrap(true)
+            .xalign(0.0)
             .sensitive(false)
             .build();
         detail.add_css_class("dim-label");
@@ -574,9 +628,8 @@ fn rebuild_check_rows(checks: &GtkBox, report: &DoctorReport) {
         row.set_margin_end(8);
         row.set_margin_top(4);
         row.set_margin_bottom(4);
-        row.append(&icon);
         row.append(&texts);
-        checks.append(&row);
+        details.append(&row);
     }
 }
 
