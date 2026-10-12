@@ -33,6 +33,7 @@ use gtk4::{
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use super::kglobalaccel;
 use super::worker::{GuiMsg, SharedConfig, Worker, WorkerCmd, lock_config};
 use crate::clips::Clips;
 use crate::config::Config;
@@ -669,16 +670,36 @@ pub(crate) fn build(
                 return;
             };
             let files = hotkeys::build_files(&entries, &hotkeys::exec_binary());
+            // Write, then make the RUNNING Plasma re-read the files: the
+            // daemon never reloads an existing component on its own (see
+            // `kglobalaccel` module docs — the stale-Exec trap), so a plain
+            // kbuildsycoca6 is not enough after a rewrite.
             let handle = gio::spawn_blocking(move || {
                 let outcome = hotkeys::write_desktop_files(&dir, &files);
-                let ksycoca = outcome.is_ok().then(hotkeys::refresh_ksycoca);
-                (outcome, ksycoca)
+                let activation = outcome.is_ok().then(|| {
+                    let names: Vec<String> =
+                        files.iter().map(|file| file.file_name.clone()).collect();
+                    match kglobalaccel::refresh_services(&dir, &names) {
+                        Ok(res @ kglobalaccel::RefreshOutcome::Refreshed) => Ok(res),
+                        // No Plasma daemon: refresh the cache only, so a
+                        // later session picks the files up.
+                        Ok(kglobalaccel::RefreshOutcome::NoDaemon) => hotkeys::refresh_ksycoca()
+                            .map(|()| kglobalaccel::RefreshOutcome::NoDaemon),
+                        Err(e) => {
+                            // Daemon misbehaved: still refresh the cache
+                            // best-effort so a re-login applies the files.
+                            let _ = hotkeys::refresh_ksycoca();
+                            Err(e)
+                        }
+                    }
+                });
+                (outcome, activation)
             });
             let section = section.clone();
             let toast_overlay = toast_overlay.clone();
             let cfg = cfg.clone();
             glib::spawn_future_local(async move {
-                let Ok((outcome, ksycoca)) = handle.await else {
+                let Ok((outcome, activation)) = handle.await else {
                     show_toast(
                         &toast_overlay,
                         "Ошибка: операция хоткеев аварийно завершилась",
@@ -702,12 +723,12 @@ pub(crate) fn build(
                         show_toast(&toast_overlay, &format!("Ошибка хоткеев: {e:#}"));
                     }
                 }
-                if let Some(Err(e)) = ksycoca {
+                if let Some(Err(e)) = activation {
                     show_toast(
                         &toast_overlay,
                         &format!(
-                            "Не удалось выполнить kbuildsycoca6 ({e:#}) — \
-                                 запустите вручную или перелогиньтесь"
+                            "Хоткеи записаны, но Plasma их не перечитала: {e:#} — \
+                                 перелогиньтесь, чтобы они заработали"
                         ),
                     );
                 }

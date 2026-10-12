@@ -172,9 +172,28 @@ fn run() -> Result<ExitCode> {
             for reason in &outcome.skipped {
                 eprintln!("пропущено: {reason}");
             }
-            println!(
-                "Активация: выполните `kbuildsycoca6`; если клавиши не появились — перелогиньтесь."
-            );
+            // Make a RUNNING Plasma re-read the files: the shortcut daemon
+            // never reloads an existing component on its own (stale Exec —
+            // see `src/ui/kglobalaccel.rs` and docs/kde-hotkeys.md), so a
+            // plain kbuildsycoca6 is not enough after a rewrite.
+            let names: Vec<String> = files.iter().map(|file| file.file_name.clone()).collect();
+            match ui::kglobalaccel::refresh_services(&dir, &names) {
+                Ok(ui::kglobalaccel::RefreshOutcome::Refreshed) => {
+                    println!("Горячие клавиши активированы в Plasma (kglobalaccel).");
+                }
+                Ok(ui::kglobalaccel::RefreshOutcome::NoDaemon) => {
+                    hotkeys::refresh_ksycoca()?;
+                    println!(
+                        "Активация: выполните `kbuildsycoca6`; если клавиши не появились — перелогиньтесь."
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "предупреждение: Plasma не перечитала хоткеи: {e:#} — \
+                         перелогиньтесь, чтобы они заработали"
+                    );
+                }
+            }
             println!(
                 "Проверка: Параметры системы → Клавиатура → Комбинации клавиш → раздел «Команды»."
             );

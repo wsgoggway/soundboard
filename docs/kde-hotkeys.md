@@ -122,15 +122,71 @@ marker-checked `net.local.soundboard.*.desktop` files and comparing the
 name+content set against the desired one («Хоткеи зарегистрированы» /
 «Хоткеи не зарегистрированы» / «Хоткеи устарели — …»), writes the files
 through the exact same `write_desktop_files` path as `--write`
-(idempotent, backups, foreign files never touched) and then runs
-`kbuildsycoca6` automatically. «Выключить» removes only our marker-checked
+(idempotent, backups, foreign files never touched) and then performs the
+live refresh from the next section automatically. «Выключить» removes only
+our marker-checked
 files (backups and foreign lookalikes survive) and refreshes ksycoca. The
 activation rules in the next section apply unchanged.
 
+## Live refresh after a rewrite (the "already there" trap)
+
+Verified live 2026-10-12 on Plasma 6.7.5: the daemon reads a service
+component's `Exec` exactly once — at startup (`loadSettings`) and when it
+first notices the component. On ksycoca `databaseChanged`,
+`refreshServices`/`detectAppsWithShortcuts` explicitly skip components that
+already exist (`// already there` → `continue`). Rewriting an existing
+desktop file (e.g. a new `Exec` after the binary moved) therefore leaves
+the daemon holding the STALE service: the shortcut fires, but the launch
+fails — `kwin_wayland` (which hosts kglobalacceld on 6.4+ Wayland) logs
+«Невозможно найти программу "soundboard"» — while the file on disk is
+already correct.
+
+The daemon re-creates a component only when its storage id reappears after
+being gone (`refreshServices` prunes components whose
+`KService::serviceByStorageId` no longer resolves). The only reliable live
+refresh is therefore a hide/restore dance, implemented in
+`src/ui/kglobalaccel.rs` (`refresh_services`) and run by BOTH the CLI
+`hotkeys --write` and the GUI «Включить/Обновить хоткеи»:
+
+1. rename our `net.local.soundboard.*.desktop` files away and run
+   `kbuildsycoca6`;
+2. poll `org.kde.KGlobalAccel.allComponents` until the components are
+   GONE — mandatory: a refresh pass that still sees the files would keep
+   the stale service object;
+3. rename the files back, `kbuildsycoca6` again;
+4. poll until all components are registered again (now with fresh `Exec`).
+
+Without the daemon (non-Plasma session) the dance degrades to a plain
+`kbuildsycoca6`. Custom user overrides in `kglobalshortcutsrc` survive the
+dance: `KServiceActionComponent::loadSettings` re-reads them on re-create.
+
+## Verifying registration and triggering without a keyboard
+
+- Registered components:
+  `gdbus call --session --dest org.kde.kglobalaccel --object-path
+  /kglobalaccel --method org.kde.KGlobalAccel.allComponents` (component
+  object paths use underscores:
+  `/component/net_local_soundboard_bruh_desktop`).
+- Binding check:
+  `gdbus call … --object-path /component/<id> --method
+  org.kde.kglobalaccel.Component.allShortcutInfos` — the key int uses the
+  Qt encoding, `Alt+1` = `0x8000000 | 0x31` = `134217777`.
+- Programmatic trigger (no keyboard; plays the clip for real):
+  `gdbus call … --object-path /component/<id> --method
+  org.kde.kglobalaccel.Component.invokeShortcut '_launch'` — the daemon
+  launches the desktop file via `KIO::ApplicationLauncherJob`; on this
+  host the launch shows up in `journalctl --user` as
+  `Started Soundboard: Bruh.` and as the process
+  `…/soundboard play <clip>`.
+- Launch failures are logged by `kwin_wayland`:
+  `journalctl --user | grep "Невозможно найти программу"` — a sure sign of
+  the stale-Exec trap above (or of a binary path that no longer exists).
+
 ## Activation
 
-- Live pickup (usual case): run `kbuildsycoca6` — the daemon sees the ksycoca
-  `databaseChanged` and registers the new shortcuts.
+- Usual case: no manual step — `soundboard hotkeys --write` and the GUI
+  «Включить/Обновить хоткеи» perform the full live refresh themselves
+  (hide/restore dance + two `kbuildsycoca6` runs, see above).
 - Guaranteed fallback: log out and back in (the registry loads all paths at
   startup). On sessions where the standalone daemon runs (X11),
   `systemctl --user restart plasma-kglobalaccel.service` also works; on

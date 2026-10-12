@@ -6,6 +6,7 @@
 //! `worker::SharedConfig` (UI mutates, worker snapshots — see the worker
 //! module docs).
 
+pub mod kglobalaccel;
 pub mod window;
 pub mod worker;
 

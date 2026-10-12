@@ -128,10 +128,13 @@ clips (sorted) map to `Alt+1`…`Alt+9`. `soundboard hotkeys --write`
 generates idempotent, marker-checked
 `~/.local/share/applications/net.local.soundboard.<slug>.desktop` files
 (`X-KDE-Shortcuts=Alt+N`); foreign files are never touched, overwrites are
-backed up. Activate with `kbuildsycoca6` (or re-login). The same management
+backed up. Activation is automatic: after writing, the running Plasma is
+made to re-read the files (a running kglobalacceld never reloads an
+existing component on its own — a plain `kbuildsycoca6` is not enough; a
+re-login remains the guaranteed fallback). The same management
 lives in the app: **Настройки → «Глобальные хоткеи»** shows the table and
 the registration state (registered / not registered / stale), **Включить /
-Обновить** writes the files and runs `kbuildsycoca6` for you, **Выключить**
+Обновить** writes the files and activates them for you, **Выключить**
 removes only soundboard's own files. Details and Plasma internals:
 [`docs/kde-hotkeys.md`](docs/kde-hotkeys.md),
 [ADR 0002](docs/adr/0002-kde-hotkeys-via-desktop-files.md).
