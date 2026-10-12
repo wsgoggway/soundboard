@@ -1,0 +1,7 @@
+# Toolchain pin for the soundboard project.
+# NOTE: mise's `rust` here is a symlink backend pointing at the rustup
+# toolchain in ~/.cargo/bin. The `stable` alias currently resolves to
+# rustc 1.97.0 (2026-07-07). Re-run `rustc --version` after a rustup
+# update; bump this pin deliberately, not silently.
+[tools]
+rust = "stable"
