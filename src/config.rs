@@ -83,20 +83,32 @@ fn expand_tilde(path: &Path) -> PathBuf {
     }
 }
 
-/// Default config file location: `~/.config/soundboard/config.toml`.
-#[must_use]
-pub fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("soundboard")
-        .join("config.toml")
+/// Default config file location: `<config dir>/soundboard/config.toml`.
+///
+/// # Errors
+/// Fails when the XDG config directory cannot be determined (neither
+/// `XDG_CONFIG_HOME` nor `HOME` usable). It used to fall back silently to the
+/// current working directory, which could create stray `./soundboard` folders
+/// — an explicit error is the honest behavior.
+pub fn config_path() -> Result<PathBuf> {
+    config_path_in(dirs::config_dir().as_deref())
+}
+
+/// Pure core of [`config_path`], unit-testable without touching the
+/// environment.
+fn config_path_in(config_dir: Option<&Path>) -> Result<PathBuf> {
+    let dir = config_dir.ok_or_else(|| {
+        anyhow::anyhow!("cannot determine the config directory (set XDG_CONFIG_HOME or HOME)")
+    })?;
+    Ok(dir.join("soundboard").join("config.toml"))
 }
 
 impl Config {
     /// Loads config from the default location; defaults if the file is
-    /// missing, error on malformed content.
+    /// missing, error on malformed content or on an undeterminable config
+    /// directory.
     pub fn load() -> Result<Self> {
-        Self::load_from(&config_path())
+        Self::load_from(&config_path()?)
     }
 
     /// Loads config from an explicit path (unit-testable variant of [`Config::load`]).
@@ -123,10 +135,10 @@ impl Config {
     }
 
     /// Saves config to the default location, creating parent directories.
-    /// Used by the GUI (M3); not exercised by the M1 CLI paths yet.
+    /// Used by the GUI (M3); not exercised by the CLI paths yet.
     #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
-        self.save_to(&config_path())
+        self.save_to(&config_path()?)
     }
 
     /// Saves config to an explicit path (unit-testable variant of [`Config::save`]).
@@ -245,5 +257,17 @@ mod tests {
         let cfg = Config::load_from(&path).expect("load");
         let home = dirs::home_dir().expect("home dir");
         assert_eq!(cfg.clips_dir, home.join("my-clips"));
+    }
+
+    #[test]
+    fn config_path_uses_given_base_dir() {
+        let path = config_path_in(Some(Path::new("/cfg"))).expect("path");
+        assert_eq!(path, Path::new("/cfg/soundboard/config.toml"));
+    }
+
+    #[test]
+    fn config_path_errors_without_base_dir() {
+        let err = config_path_in(None).expect_err("must not fall back to CWD");
+        assert!(err.to_string().contains("config directory"), "{err}");
     }
 }
