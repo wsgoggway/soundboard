@@ -100,7 +100,7 @@ keys / malformed values → error):
 | Key | Default | Meaning |
 |---|---|---|
 | `clips_dir` | `~/Music/soundboard-clips` | Clips directory (leading `~` expanded). |
-| `volume` | `0.9` | Playback volume, `0.0..=1.0` (out-of-range values are clamped). |
+| `volume` | `0.9` | Playback volume, `0.0..=1.0` (out-of-range values are clamped). The GUI slider persists here with a short debounce, so hotkey-spawned `soundboard play` plays at the shown level. |
 | `interrupt_mode` | `true` | Re-clicking a clip restarts it; `false` plays overlapping copies. |
 | `mic_mix` | `true` | Pass the real microphone through into the virtual mic. |
 | `monitoring` | `false` | Also route clip audio to the real speakers. |

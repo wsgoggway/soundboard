@@ -41,7 +41,9 @@ Jitsi, Discord, …).
   every successful reconcile), shared `SharedConfig` (Arc<Mutex<Config>>;
   UI mutates, worker snapshots — `Config::save` runs only on the worker),
   clip grid (FlowBox of buttons, `suggested-action` highlight while
-  playing), volume slider (persists on the next explicit save or shutdown),
+  playing), volume slider (persisted by the worker with a ~300 ms trailing
+  debounce, `WorkerCmd::SaveVolume` — hotkey-spawned `soundboard play`
+  reads the config volume),
   mic-mix/monitoring/interrupt `SwitchRow`s, error toasts
   (`adw::ToastOverlay`), graceful SIGINT/SIGTERM (libc handler + atomic +
   main-loop poll → the same close-request path — glib 0.22 has no unix

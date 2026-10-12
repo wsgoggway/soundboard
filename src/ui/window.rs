@@ -13,8 +13,9 @@
 //! under the lock (in-memory, instant for the worker), then either send
 //! `SaveConfig` + `EnsureGraph` (mic_mix/monitoring change loopbacks, so
 //! the graph must reconcile) or `SaveConfig` only (interrupt_mode). The
-//! slider saves nothing per tick — persistence happens with the next
-//! explicit save (any toggle or shutdown).
+//! slider sends `SaveVolume` per tick — the worker persists the config with
+//! a ~300 ms trailing debounce, because hotkey-spawned `soundboard play`
+//! processes read the config volume and must agree with the slider.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -771,12 +772,15 @@ pub(crate) fn build(
     }
 
     // Volume slider: mutate the shared config in memory on every tick; the
-    // worker uses the current value for new plays, persistence happens with
-    // the next explicit save (a toggle or shutdown).
+    // worker uses the current value for new plays and persists it with a
+    // ~300 ms trailing debounce (hotkey-spawned `soundboard play` processes
+    // read the config volume, so the slider must reach config.toml).
     {
         let cfg = cfg.clone();
+        let worker = worker.clone();
         volume_scale.adjustment().connect_value_changed(move |adj| {
             lock_config(&cfg).volume = slider_to_volume_factor(adj.value());
+            worker.send(WorkerCmd::SaveVolume);
         });
     }
 

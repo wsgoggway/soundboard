@@ -15,7 +15,9 @@
 //! mutates fields under the lock (cheap, in-memory); the worker takes a
 //! `clone()` snapshot before every blocking operation, so the UI thread can
 //! never block on audio. Persistence (`Config::save`, a small file write)
-//! happens only on the worker thread (`WorkerCmd::SaveConfig` or shutdown).
+//! happens only on the worker thread (`WorkerCmd::SaveConfig` from the
+//! toggles, the trailing-debounced `WorkerCmd::SaveVolume` from the slider,
+//! or shutdown).
 //!
 //! Playback engine (M3b): the worker owns a persistent [`PwCatPlayer`] and a
 //! [`Scheduler`]. `Play { name }` resolves the clip against a fresh
@@ -56,7 +58,7 @@ use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
@@ -81,6 +83,45 @@ pub fn lock_config(cfg: &SharedConfig) -> MutexGuard<'_, Config> {
 /// How often the idle worker reaps finished playbacks to keep the UI
 /// playing-set current.
 const REAP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Quiet period after the last slider move before the volume is persisted
+/// (checked on every worker loop pass, so the actual save lands within
+/// `[debounce, debounce + REAP_INTERVAL]`).
+const VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Trailing-debounce timer for the volume persistence: every slider tick
+/// restarts the window, a save is due once the slider has been quiet for
+/// the debounce duration. Pure timing logic, unit-testable without the
+/// filesystem.
+#[derive(Default)]
+struct Debounce {
+    pending_since: Option<Instant>,
+}
+
+impl Debounce {
+    /// Records (or restarts) the debounce window at `now`.
+    fn request(&mut self, now: Instant) {
+        self.pending_since = Some(now);
+    }
+
+    /// An explicit save (a toggle or shutdown) persisted everything
+    /// already: drop the pending volume write.
+    fn clear(&mut self) {
+        self.pending_since = None;
+    }
+
+    /// True when at least `debounce` has passed since the last request;
+    /// consumes the pending request.
+    fn poll(&mut self, now: Instant, debounce: Duration) -> bool {
+        match self.pending_since {
+            Some(requested) if now.duration_since(requested) >= debounce => {
+                self.pending_since = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 /// Registry name under which the test tone is tracked in the scheduler (not
 /// a real clip; the UI grid ignores it, «Стоп всё» stops it).
@@ -109,8 +150,13 @@ pub enum WorkerCmd {
         name: Option<String>,
     },
     /// Persist the current shared config to disk (worker thread does the
-    /// blocking write; used by the toggles and the volume slider).
+    /// blocking write; used by the toggles).
     SaveConfig,
+    /// The volume slider moved: persist soon, with a trailing debounce
+    /// ([`VOLUME_SAVE_DEBOUNCE`]) — slider ticks are frequent and the file
+    /// write must not. Hotkey-spawned `soundboard play` processes read the
+    /// config volume, so the slider value has to reach config.toml.
+    SaveVolume,
     /// Stop the meter and all playbacks, persist the config, then exit (the
     /// graph stays up).
     Shutdown,
@@ -316,6 +362,8 @@ fn run_worker(
     let mut player = PwCatPlayer::new();
     let mut scheduler = Scheduler::new();
     let mut published: Vec<String> = Vec::new();
+    // Trailing-debounced volume persistence (see `WorkerCmd::SaveVolume`).
+    let mut volume_saver = Debounce::default();
     // Wav files of live test playbacks (handle -> path); removed as soon as
     // the corresponding playback is reaped, stopped or the worker exits —
     // the file must outlive the pw-cat process reading it.
@@ -425,10 +473,12 @@ fn run_worker(
                     );
                 }
                 WorkerCmd::SaveConfig => {
+                    volume_saver.clear();
                     if let Err(e) = lock_config(&cfg).save() {
                         ui_err(e);
                     }
                 }
+                WorkerCmd::SaveVolume => volume_saver.request(Instant::now()),
                 WorkerCmd::Shutdown => break,
             },
             // Idle: keep the playing set honest (clips end on their own).
@@ -443,6 +493,14 @@ fn run_worker(
             }
             // The app dropped the command sender: shut down the same way.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Debounced volume persistence: due once the slider has been quiet
+        // for the debounce period; checked on every loop pass (commands and
+        // idle timeouts alike).
+        if volume_saver.poll(Instant::now(), VOLUME_SAVE_DEBOUNCE)
+            && let Err(e) = lock_config(&cfg).save()
+        {
+            ui_err(e);
         }
     }
 
@@ -561,7 +619,9 @@ fn start_meter(ui: &impl Fn(GuiMsg), meter_tx: &async_channel::Sender<f32>) -> O
 
 /// Degraded mode when the pulse session could not be opened at startup:
 /// `EnsureGraph`/`Doctor` re-open a session per command, playback is
-/// impossible without a server.
+/// impossible without a server. Volume persistence follows the same
+/// debounced policy as the healthy loop.
+#[allow(clippy::too_many_lines)] // one linear per-command routine
 fn wait_for_commands_without_session(
     cfg: SharedConfig,
     cmd_rx: std::sync::mpsc::Receiver<WorkerCmd>,
@@ -570,52 +630,65 @@ fn wait_for_commands_without_session(
 ) {
     let ui_err = |e: anyhow::Error| ui(GuiMsg::Error(format!("{e:#}")));
     let mut meter: Option<MeterHandle> = None;
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            WorkerCmd::EnsureGraph | WorkerCmd::Doctor => match open_graph() {
-                Ok(mut graph) => {
-                    let snapshot = lock_config(&cfg).clone();
-                    let outcome = if cmd == WorkerCmd::EnsureGraph {
-                        match graph.reconcile(&snapshot) {
-                            Ok(report) => {
-                                ui(GuiMsg::GraphUp(report));
-                                true
+    let mut volume_saver = Debounce::default();
+    loop {
+        match cmd_rx.recv_timeout(REAP_INTERVAL) {
+            Ok(cmd) => match cmd {
+                WorkerCmd::EnsureGraph | WorkerCmd::Doctor => match open_graph() {
+                    Ok(mut graph) => {
+                        let snapshot = lock_config(&cfg).clone();
+                        let outcome = if cmd == WorkerCmd::EnsureGraph {
+                            match graph.reconcile(&snapshot) {
+                                Ok(report) => {
+                                    ui(GuiMsg::GraphUp(report));
+                                    true
+                                }
+                                Err(e) => {
+                                    ui_err(e);
+                                    false
+                                }
                             }
-                            Err(e) => {
-                                ui_err(e);
-                                false
-                            }
+                        } else {
+                            false
+                        };
+                        ui(GuiMsg::Status(graph.doctor(&snapshot)));
+                        if outcome {
+                            // Same restart-on-repair policy as the healthy loop.
+                            meter_stop(&mut meter);
+                            meter = start_meter(&ui, &meter_tx);
                         }
-                    } else {
-                        false
-                    };
-                    ui(GuiMsg::Status(graph.doctor(&snapshot)));
-                    if outcome {
-                        // Same restart-on-repair policy as the healthy loop.
-                        meter_stop(&mut meter);
-                        meter = start_meter(&ui, &meter_tx);
+                    }
+                    Err(e) => ui_err(e),
+                },
+                WorkerCmd::PlayTest => {
+                    ui_err(anyhow::anyhow!(
+                        "нет связи с pulse-сервером — тест невозможен"
+                    ));
+                }
+                WorkerCmd::Play { name } => {
+                    ui_err(anyhow::anyhow!(
+                        "нет связи с pulse-сервером — «{name}» не воспроизведён"
+                    ));
+                }
+                // Degraded mode never spawned anything: nothing to stop.
+                WorkerCmd::Stop { .. } => {}
+                WorkerCmd::SaveConfig => {
+                    volume_saver.clear();
+                    if let Err(e) = lock_config(&cfg).save() {
+                        ui_err(e);
                     }
                 }
-                Err(e) => ui_err(e),
+                WorkerCmd::SaveVolume => volume_saver.request(Instant::now()),
+                WorkerCmd::Shutdown => break,
             },
-            WorkerCmd::PlayTest => {
-                ui_err(anyhow::anyhow!(
-                    "нет связи с pulse-сервером — тест невозможен"
-                ));
-            }
-            WorkerCmd::Play { name } => {
-                ui_err(anyhow::anyhow!(
-                    "нет связи с pulse-сервером — «{name}» не воспроизведён"
-                ));
-            }
-            // Degraded mode never spawned anything: nothing to stop.
-            WorkerCmd::Stop { .. } => {}
-            WorkerCmd::SaveConfig => {
-                if let Err(e) = lock_config(&cfg).save() {
-                    ui_err(e);
-                }
-            }
-            WorkerCmd::Shutdown => break,
+            // Idle passes only give the debounce timer a chance to fire.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if volume_saver.poll(Instant::now(), VOLUME_SAVE_DEBOUNCE)
+            && let Err(e) = lock_config(&cfg).save()
+        {
+            ui_err(e);
         }
     }
     if let Err(e) = lock_config(&cfg).save() {
@@ -628,6 +701,50 @@ fn wait_for_commands_without_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_debounce_persists_after_the_quiet_period() {
+        let mut saver = Debounce::default();
+        let start = Instant::now();
+        // Nothing requested: never due.
+        assert!(!saver.poll(start, VOLUME_SAVE_DEBOUNCE));
+        // First tick: not due before the window elapses, due exactly on it.
+        saver.request(start);
+        assert!(!saver.poll(
+            start + VOLUME_SAVE_DEBOUNCE - Duration::from_millis(1),
+            VOLUME_SAVE_DEBOUNCE
+        ));
+        assert!(saver.poll(start + VOLUME_SAVE_DEBOUNCE, VOLUME_SAVE_DEBOUNCE));
+        // The due poll consumed the request.
+        assert!(!saver.poll(start + VOLUME_SAVE_DEBOUNCE, VOLUME_SAVE_DEBOUNCE));
+    }
+
+    #[test]
+    fn volume_debounce_restarts_on_every_slider_tick() {
+        let mut saver = Debounce::default();
+        let start = Instant::now();
+        // Continuous dragging keeps restarting the window: no save while the
+        // slider moves.
+        for tick in 1..=5_u32 {
+            saver.request(start + VOLUME_SAVE_DEBOUNCE * tick);
+            assert!(!saver.poll(
+                start + VOLUME_SAVE_DEBOUNCE * (tick + 1) - Duration::from_millis(1),
+                VOLUME_SAVE_DEBOUNCE
+            ));
+        }
+        // Quiet: the save fires exactly one window after the LAST tick.
+        let last = start + VOLUME_SAVE_DEBOUNCE * 5;
+        assert!(saver.poll(last + VOLUME_SAVE_DEBOUNCE, VOLUME_SAVE_DEBOUNCE));
+    }
+
+    #[test]
+    fn explicit_save_clears_pending_volume_persistence() {
+        let mut saver = Debounce::default();
+        let start = Instant::now();
+        saver.request(start);
+        saver.clear();
+        assert!(!saver.poll(start + VOLUME_SAVE_DEBOUNCE * 10, VOLUME_SAVE_DEBOUNCE));
+    }
 
     #[test]
     fn test_sine_has_two_seconds_of_440hz_mono() {
