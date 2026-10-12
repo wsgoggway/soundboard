@@ -1,8 +1,10 @@
 //! Entry point: parses the CLI and dispatches to the graph and player
 //! operations.
 //!
-//! `soundboard` with no subcommand is the GUI placeholder (the GTK4 UI lands
-//! in a later milestone).
+//! `soundboard` with no subcommand launches the GTK4/libadwaita GUI: it
+//! spawns the audio worker (auto reconcile + doctor at startup), shows the
+//! doctor status and the virtual mic VU meter, and leaves the graph running
+//! on close (`soundboard down` tears it down).
 //!
 //! `play` auto-reconciles the audio graph first (auto-setup): if the graph
 //! cannot come up, play fails and prints the `doctor` report as a hint.
@@ -14,8 +16,10 @@ mod cli;
 mod clips;
 mod config;
 mod graph;
+mod meter;
 mod player;
 mod scheduler;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -75,7 +79,7 @@ fn run() -> Result<ExitCode> {
     let cli = cli::Cli::parse();
     match cli.command {
         None => {
-            println!("GUI not implemented yet");
+            ui::run()?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Up) => {
