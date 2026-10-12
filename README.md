@@ -53,6 +53,15 @@ Linux with PipeWire (developed and verified on CachyOS / Arch):
 - Rust toolchain via [mise](https://mise.jdx.dev) (pinned `stable` in
   `mise.toml`)
 
+## Sounds
+
+The repo bundles the meme clips (14 files, `clips/`). Copy them into the
+default clips directory (no-clobber) with:
+
+```sh
+just clips-install
+```
+
 ## Install
 
 ```bash

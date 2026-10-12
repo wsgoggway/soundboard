@@ -13,3 +13,8 @@ lint:
 
 run:
     cargo run
+
+# Copy bundled meme clips into the user's clips directory (no-clobber)
+clips-install:
+    mkdir -p ~/Music/soundboard-clips
+    cp -n clips/* ~/Music/soundboard-clips/
