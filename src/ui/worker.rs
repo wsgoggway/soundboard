@@ -47,8 +47,9 @@
 //! Shutdown protocol: `WorkerCmd::Shutdown` → the worker persists the
 //! config (the volume slider may have moved), stops the meter and all
 //! playbacks and exits its loop; the graph is deliberately NOT torn down
-//! (it must persist for Zoom; only `soundboard down` removes it). A final
-//! `GuiMsg::ShutdownComplete` tells the window it may destroy itself.
+//! (it must persist for the conferencing app; only `soundboard down`
+//! removes it). A final `GuiMsg::ShutdownComplete` tells the window it may
+//! destroy itself.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -446,7 +447,8 @@ fn run_worker(
     }
 
     // Persist the config (the volume slider may have moved since the last
-    // explicit save), then stop all audio. The graph stays up for Zoom.
+    // explicit save), then stop all audio. The graph stays up for the
+    // conferencing app.
     if let Err(e) = lock_config(&cfg).save() {
         ui_err(e);
     }

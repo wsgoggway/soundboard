@@ -1,18 +1,20 @@
 # soundboard
 
-A Rust + GTK4 soundboard for Zoom on Linux: it creates a PipeWire virtual
-microphone (the native `Audio/Source/Virtual` node `virtmic`, shown to apps
-as **Virtual_Mic**) and plays short meme audio clips into it, so a keypress
-or click "says" it straight into the call while your real microphone keeps
-working.
+A Rust + GTK4 soundboard for video calls on Linux: it creates a PipeWire
+virtual microphone (the native `Audio/Source/Virtual` node `virtmic`, shown
+to apps as **Virtual_Mic**) and plays short meme audio clips into it, so a
+keypress or click "says" it straight into the call while your real
+microphone keeps working. Works with any conferencing app that captures a
+microphone: Zoom, Google Meet, Telegram, Jitsi, Discord, …
 
 ## Features
 
 - PipeWire virtual microphone built as a native `Audio/Source/Virtual`
   node plus `pw-link` feeds (see `docs/pipewire-recipe.md`,
   [ADR 0004](docs/adr/0004-virtmic-native-source-node.md)) — idempotent
-  `up`/`down`/`doctor` management. Zoom lists it as a real microphone
-  (Zoom filters monitor sources — exactly why the native node is used).
+  `up`/`down`/`doctor` management. Conferencing apps list it as a real
+  microphone (they filter monitor sources — exactly why the native node is
+  used).
 - GTK4/libadwaita GUI: clip grid with playing highlight, live VU meter,
   volume, mic-mix / hear-yourself / re-click-interrupt toggles, error toasts.
 - CLI playback (`play`/`stop`) that works across processes, including
@@ -26,8 +28,9 @@ working.
 Overview, component responsibilities and the verified audio topology
 diagram live in [`docs/hld.md`](docs/hld.md). Short version: clips are
 played by a `pw-cat` subprocess into the `soundboard` null-sink, `pw-link`
-routes its monitor ports into the native `virtmic` source node, Zoom
-captures the pulse source `virtmic` ("Virtual_Mic"); with `mic_mix` the
+routes its monitor ports into the native `virtmic` source node, the
+conferencing app captures the pulse source `virtmic` ("Virtual_Mic"); with
+`mic_mix` the
 real microphone is linked into the same inputs (PipeWire mixes multiple
 feeds), with `monitoring` a loopback duplicates clips to the real speakers.
 Design decisions: [ADR 0001](docs/adr/0001-pwcat-player-process-model.md)
@@ -63,11 +66,11 @@ bare command, so `~/.cargo/bin` must be on your `PATH` for hotkeys to work.
    (`wav`/`mp3`/`ogg`/`oga`/`flac`/`opus`/`m4a`; file stem = clip name).
 2. Run `soundboard` — the GUI starts and sets up the audio graph
    automatically at launch.
-3. In Zoom: Settings → Audio → Microphone = **Virtual_Mic**
-   (Russian UI: Настройки → Звук → Микрофон). The pulse source is
-   `virtmic` — a real (non-monitor) source backed by the native
-   Audio/Source/Virtual node. If Zoom had another device selected,
-   re-select it — Zoom caches input devices.
+3. In your conferencing app's audio settings (Zoom: Настройки → Звук;
+   Google Meet, Telegram, Jitsi, Discord — similar) set the microphone to
+   **Virtual_Mic**. The pulse source is `virtmic` — a real (non-monitor)
+   source backed by the native Audio/Source/Virtual node. If the app had
+   another device selected, re-select it — apps cache input devices.
 4. Click **Тест** in the GUI: a 2 s 440 Hz tone plays and the VU bar
    ("Виртуальный микрофон") reacts.
 5. Or headless: `soundboard play airhorn`, `soundboard doctor`,
@@ -122,7 +125,7 @@ Verified once per release on the real desktop session:
    «Граф: OK».
 2. `soundboard doctor` is all green («все проверки пройдены»), exit code 0.
 3. The VU bar reacts to the «Тест» button (440 Hz) and to clips.
-4. Clicking a clip is audible in Zoom with microphone = Virtual_Mic.
+4. Clicking a clip is audible in the call with microphone = Virtual_Mic.
 5. Interrupt/overlap: re-clicking the same clip restarts it
    (`interrupt_mode` on), different clips play over each other; turning the
    «Перезапускать клип повторным нажатием» toggle off switches to copies.
@@ -131,18 +134,20 @@ Verified once per release on the real desktop session:
    mic, «Слышать себя» duplicates clips to the speakers; both reconcile the
    graph immediately.
 8. Ctrl+C (or closing the window) exits gracefully — config saved,
-   playbacks and meter stopped, **the graph stays up** for Zoom.
+   playbacks and meter stopped, **the graph stays up** for the conferencing
+   app.
 9. `soundboard hotkeys --write` + `kbuildsycoca6`, then `Alt+1` plays the
    first clip (sorted) even with another window focused.
 
 ## Troubleshooting
 
-- **Virtual mic is silent in Zoom**: run `soundboard doctor` — fix whatever
-  fails (or press «Починить граф» / run `soundboard up`), then re-select
-  "Virtual_Mic" in Zoom's audio settings; Zoom caches the previously chosen
-  device. **If Virtual_Mic is missing from Zoom's mic list entirely**:
-  run `soundboard doctor` and re-open Zoom's audio settings after the
-  graph is green (Zoom only rescans devices when its settings are reopened).
+- **Virtual mic is silent in the call**: run `soundboard doctor` — fix
+  whatever fails (or press «Починить граф» / run `soundboard up`), then
+  re-select "Virtual_Mic" in the app's audio settings; apps cache the
+  previously chosen device. **If Virtual_Mic is missing from the app's mic
+  list entirely**: run `soundboard doctor` and re-open the app's audio
+  settings after the graph is green (apps usually rescan devices only when
+  their settings are reopened).
 - **No signal although the graph is green**: probe the source directly with
   `cargo run --example vu_probe --` (defaults to `virtmic`, prints
   ~10 peak levels/second, Ctrl+C to stop). Peaks while playing → capture
@@ -153,10 +158,10 @@ Verified once per release on the real desktop session:
   warning. If you lost the state file while the graph was up, run
   `soundboard up` once (it adopts the exact-args modules back into the
   state), then `soundboard down` works again.
-- **The graph survives app close by design** (Zoom keeps its device);
-  `soundboard down` removes it completely — including the native node
-  (`pw-cli destroy`; a pipewire daemon restart also removes it, `up`
-  recreates everything).
+- **The graph survives app close by design** (the conferencing app keeps
+  its device); `soundboard down` removes it completely — including the
+  native node (`pw-cli destroy`; a pipewire daemon restart also removes it,
+  `up` recreates everything).
 - **Do NOT hand-roll the virtual mic** with pulse-level
   `media.class=Audio/Source/Virtual` null-sinks or `pw-loopback` — both are
   live-tested broken on PipeWire 1.6.9 (silently re-targeted to the default

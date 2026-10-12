@@ -1,7 +1,9 @@
 # soundboard
 
-A Rust + GTK4 soundboard for Zoom on Linux: creates a PipeWire virtual
-microphone and plays short meme audio clips into it.
+A Rust + GTK4 soundboard for video calls on Linux: creates a PipeWire
+virtual microphone and plays short meme audio clips into it. Works with any
+conferencing app that captures a microphone (Zoom, Google Meet, Telegram,
+Jitsi, Discord, …).
 
 ## Stack
 

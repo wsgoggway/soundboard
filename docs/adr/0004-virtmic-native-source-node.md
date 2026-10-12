@@ -56,8 +56,8 @@ whole and everything re-adopts).
 
 The pulse capture constant changes from `virtmic.monitor` to `virtmic`
 (`SOURCE_VIRTMIC`); the meter and `vu_probe` capture it. The user-facing
-surface is unchanged: Zoom selects "Virtual_Mic", playback target stays
-`soundboard`.
+surface is unchanged: the conferencing app selects "Virtual_Mic", playback
+target stays `soundboard`.
 
 ## Alternatives considered
 
@@ -91,8 +91,8 @@ surface is unchanged: Zoom selects "Virtual_Mic", playback target stays
   kills the node and its links, exactly like pulse modules die on a
   pipewire-pulse restart. Recovery is the same: run `up` (or reopen the
   GUI, which auto-reconciles at startup).
-- Zoom sees the source as a real mic-shaped device; the doctor check
-  "источник virtmic … не является монитором" pins the regression: if the
-  graph ever regresses to a monitor-named-virtmic, doctor fails.
+- Conferencing apps see the source as a real mic-shaped device; the doctor
+  check "источник virtmic … не является монитором" pins the regression: if
+  the graph ever regresses to a monitor-named-virtmic, doctor fails.
 - `pw-cli`/`pw-link` binaries become runtime requirements of the graph
   layer (they ship with pipewire-audio, same as pw-cat).

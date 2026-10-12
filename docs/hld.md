@@ -1,8 +1,9 @@
 # soundboard — High-Level Design
 
 A Rust + GTK4 soundboard that creates a PipeWire virtual microphone and
-plays short audio clips into it, for Zoom and other conferencing apps on
-Linux. The audio topology is the live-verified contract in
+plays short audio clips into it, for conferencing apps (Zoom, Google Meet,
+Telegram, Jitsi, …) on Linux. The audio topology is the live-verified
+contract in
 [`docs/pipewire-recipe.md`](pipewire-recipe.md); this document maps that
 contract onto the code. Keep it in sync with the code in the same commit.
 
@@ -29,10 +30,10 @@ sink `soundboard` (pulse), the NATIVE virtual source node `virtmic`
 (`Audio/Source/Virtual`, description "Virtual_Mic") fed by `pw-link` port
 pairs, and two optional passthroughs: real-mic links (`mic_mix`) into the
 same virtmic inputs (the adapter soft-mixer sums multiple feeds) and the
-pulse monitoring loopback to the real speakers. Zoom captures the pulse
-source `virtmic` — a real source, NOT a monitor (Zoom filters monitor
-sources; that is why the native node exists, ADR 0004). The GUI meter
-captures the same source.
+pulse monitoring loopback to the real speakers. The conferencing app
+captures the pulse source `virtmic` — a real source, NOT a monitor (such
+apps filter monitor sources; that is why the native node exists,
+ADR 0004). The GUI meter captures the same source.
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
@@ -43,7 +44,7 @@ flowchart LR
     MIC["real mic<br/>default source"]
     RS["real sink<br/>default sink"]
     LB["monitoring loopback<br/>pulse"]
-    ZOOM["Zoom<br/>microphone = Virtual_Mic"]
+    CONF["conferencing app<br/>microphone = Virtual_Mic"]
     VU["VU meter<br/>GUI and vu_probe"]
 
     CLIPS -->|"pw-cat"| SB
@@ -51,7 +52,7 @@ flowchart LR
     MIC -.->|"pw-link capture_FL/FR (mic_mix)"| VM
     SB -.->|"module-loopback (monitoring)"| LB
     LB --> RS
-    VM -->|"pulse source virtmic"| ZOOM
+    VM -->|"pulse source virtmic"| CONF
     VM -->|"meter captures"| VU
 ```
 
@@ -104,7 +105,8 @@ flowchart LR
   first → `pw-cat` spawned → playing set published to highlight the grid.
 - **Shutdown (GUI)**: close request (also routed from SIGINT/SIGTERM) →
   worker persists config, stops meter + playbacks → window destroyed; the
-  audio graph stays up for Zoom. `soundboard down` is the explicit teardown.
+  audio graph stays up for the conferencing app. `soundboard down` is the
+  explicit teardown.
 
 ## Decision records
 

@@ -30,7 +30,7 @@ use libadwaita::prelude::*;
 use super::worker::{GuiMsg, SharedConfig, Worker, WorkerCmd, lock_config};
 use crate::clips::Clips;
 use crate::config::Config;
-use crate::graph::{DoctorReport, Report, ZOOM_HINT};
+use crate::graph::{CONF_HINT, DoctorReport, Report};
 
 /// Summary line for a doctor report.
 pub(crate) fn doctor_summary_line(report: &DoctorReport) -> &'static str {
@@ -268,12 +268,12 @@ pub(crate) fn build(
         .hexpand(true)
         .value(0.0)
         .build();
-    let zoom_hint = Label::builder()
-        .label(ZOOM_HINT)
+    let conf_hint = Label::builder()
+        .label(CONF_HINT)
         .halign(gtk4::Align::Start)
         .wrap(true)
         .build();
-    zoom_hint.add_css_class("dim-label");
+    conf_hint.add_css_class("dim-label");
 
     // Clips section: caption + refresh button, then the grid.
     let grid = Rc::new(ClipGrid::new());
@@ -331,7 +331,7 @@ pub(crate) fn build(
     content.append(&buttons);
     content.append(&meter_caption);
     content.append(&level_bar);
-    content.append(&zoom_hint);
+    content.append(&conf_hint);
     content.append(&clips_header);
     content.append(&grid.container());
     content.append(&volume_caption);
@@ -474,7 +474,8 @@ pub(crate) fn build(
 
     // Graceful shutdown: keep the window until the worker confirms cleanup
     // (config saved, meter stopped, playbacks stopped); the graph stays up
-    // for Zoom. SIGINT/SIGTERM route through this same close-request path.
+    // for the conferencing app. SIGINT/SIGTERM route through this same
+    // close-request path.
     {
         let worker = worker.clone();
         window.connect_close_request(move |_window| {

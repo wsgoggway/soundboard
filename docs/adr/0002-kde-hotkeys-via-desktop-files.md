@@ -4,8 +4,9 @@ Date: 2026-10-12. Status: accepted (M4). Research base: `docs/kde-hotkeys.md`.
 
 ## Context
 
-Clips must be playable from anywhere (Zoom in focus, game fullscreen) with a
-keypress. The host is CachyOS with KDE Plasma 6.7.5 on a Wayland session.
+Clips must be playable from anywhere (conferencing app in focus, game
+fullscreen) with a keypress. The host is CachyOS with KDE Plasma 6.7.5 on a
+Wayland session.
 
 Verified facts about Plasma 6 global shortcuts (see `docs/kde-hotkeys.md` for
 sources and D-Bus evidence):

@@ -1,9 +1,9 @@
 //! vu_probe — live peak-level probe for a PipeWire/PulseAudio source.
 //!
 //! Debugging tool for the soundboard virtual mic: connects to `source`
-//! (default `virtmic`, the native Audio/Source/Virtual node — what Zoom
-//! selects as "Virtual_Mic") and prints the capture peak about 10 times per
-//! second, e.g.
+//! (default `virtmic`, the native Audio/Source/Virtual node — what
+//! conferencing apps select as "Virtual_Mic") and prints the capture peak
+//! about 10 times per second, e.g.
 //!
 //! ```text
 //! 0.413  ################......................

@@ -5,7 +5,8 @@ use clap::Parser;
 use clap::Subcommand;
 
 /// Soundboard: воспроизводит короткие аудиоклипы в виртуальный микрофон
-/// PipeWire для Zoom и других конференций в Linux.
+/// PipeWire для видеозвонков (Zoom, Google Meet, Telegram, Jitsi — любых
+/// приложений связи) в Linux.
 #[derive(Parser, Debug)]
 #[command(name = "soundboard", version, about, long_about = None)]
 pub struct Cli {

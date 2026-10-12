@@ -59,15 +59,16 @@ pw-cat --playback --target soundboard /path/to/clip.wav
   `node.name`.
 - `object.linger=true` keeps the node alive after pw-cli exits.
 
-### Why a native node (the Zoom problem)
+### Why a native node (the monitor-source problem)
 
-Zoom FILTERS monitor sources from its microphone list. The old pulse design
-(null-sink `virtmic` captured via its monitor `virtmic.monitor`) produced a
-source that Zoom never offered — user-confirmed on the device picker
-screenshot. The native `Audio/Source/Virtual` node is exposed by
+Conferencing apps FILTER monitor sources from their microphone lists
+(research-verified on Zoom). The old pulse design (null-sink `virtmic`
+captured via its monitor `virtmic.monitor`) produced a source that the
+apps never offered — user-confirmed on the Zoom device-picker screenshot.
+The native `Audio/Source/Virtual` node is exposed by
 pipewire-pulse as a REAL source named `virtmic` — «Monitor of Sink: n/a»,
-with the HARDWARE flag — and THIS source is what Zoom lists as
-"Virtual_Mic" (ADR 0004 has the full decision record).
+with the HARDWARE flag — and THIS source is what the conferencing app
+lists as "Virtual_Mic" (ADR 0004 has the full decision record).
 
 ## Exact names as the pulse layer sees them
 
@@ -75,7 +76,7 @@ with the HARDWARE flag — and THIS source is what Zoom lists as
 |--------------|----------------------|------------------------------------------------------------|
 | sink         | `soundboard`         | description "Meme_Soundboard"; clips play here             |
 | source       | `soundboard.monitor` | monitor of the soundboard sink; feeds the links/loopbacks  |
-| source       | `virtmic`            | **NOT a monitor** — the native node itself; THIS is what Zoom selects as "Virtual_Mic" |
+| source       | `virtmic`            | **NOT a monitor** — the native node itself; THIS is what the conferencing app selects as "Virtual_Mic" |
 
 The native node has NO pulse owner module — it cannot be unloaded via
 `pactl`; teardown is `pw-cli destroy <node-id>` (see below). The node and

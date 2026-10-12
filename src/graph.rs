@@ -11,9 +11,9 @@
 //! Native layer (via `pw-cli` / `pw-link` shell-outs):
 //! - native virtual source node `virtmic`
 //!   (`media.class=Audio/Source/Virtual`, description "Virtual_Mic") — THIS
-//!   is what Zoom lists as a microphone (research-verified: Zoom filters
-//!   monitor sources, so the old pulse null-sink monitor `virtmic.monitor`
-//!   never showed up);
+//!   is what conferencing apps list as a microphone (research-verified on
+//!   Zoom: such apps filter monitor sources, so the old pulse null-sink
+//!   monitor `virtmic.monitor` never showed up);
 //! - links `soundboard:monitor_FL/FR -> virtmic:input_FL/FR` (always; the
 //!   adapter's soft-mixer mixes multiple feeds into one input port);
 //! - links `<real_mic>:capture_FL/FR -> virtmic:input_FL/FR` (only when
@@ -110,7 +110,8 @@ pub const VIRTMIC_INPUT_PORTS: [&str; 2] = ["input_FL", "input_FR"];
 pub const MIC_CAPTURE_PORTS: [&str; 2] = ["capture_FL", "capture_FR"];
 /// Human-readable hint appended to `doctor` output (Russian for the user;
 /// node names stay as the server reports them).
-pub const ZOOM_HINT: &str = "Zoom: Настройки \u{2192} Звук \u{2192} Микрофон = \"Virtual_Mic\"";
+pub const CONF_HINT: &str = "выбери Virtual_Mic как микрофон в приложении связи \
+(Zoom, Google Meet, Telegram, Jitsi, Discord — любом; Настройки \u{2192} Звук)";
 
 const MODULE_NULL_SINK: &str = "module-null-sink";
 const MODULE_LOOPBACK: &str = "module-loopback";
@@ -484,7 +485,8 @@ fn real_mic(backend: &mut dyn PulseBackend) -> anyhow::Result<Option<String>> {
 pub trait PulseBackend {
     /// Lists all loaded modules.
     fn modules(&mut self) -> anyhow::Result<Vec<ModuleInfo>>;
-    /// Lists all sources (used by the Zoom-visibility doctor check).
+    /// Lists all sources (used by the conferencing-app-visibility doctor
+    /// check).
     fn sources(&mut self) -> anyhow::Result<Vec<PulseSourceInfo>>;
     /// Loads a module, returns its index.
     fn load(&mut self, name: &str, args: &str) -> anyhow::Result<u32>;
@@ -1296,7 +1298,8 @@ impl DoctorReport {
         self.checks.iter().all(|c| c.passed)
     }
 
-    /// Human-readable report: one line per check, then the Zoom hint.
+    /// Human-readable report: one line per check, then the conferencing-app
+    /// hint.
     #[must_use]
     pub fn render(&self) -> String {
         let mut lines: Vec<String> = self
@@ -1312,7 +1315,7 @@ impl DoctorReport {
                 format!("[{status}] {}{detail}", c.name)
             })
             .collect();
-        lines.push(format!("Подсказка: {ZOOM_HINT}"));
+        lines.push(format!("Подсказка: {CONF_HINT}"));
         lines.push(if self.all_passed() {
             "все проверки пройдены".to_string()
         } else {
@@ -1385,8 +1388,8 @@ fn doctor_virtmic_node(native: &mut dyn NativeBackend, name: &str) -> anyhow::Re
 }
 
 /// Doctor check: the pulse source `virtmic` exists and is NOT a monitor —
-/// the Zoom-visibility check (Zoom filters monitor sources from its mic
-/// list).
+/// the conferencing-app-visibility check (such apps, e.g. Zoom, filter
+/// monitor sources from their mic lists).
 fn doctor_virtmic_source(name: &str, pulse_sources: Option<&[PulseSourceInfo]>) -> Check {
     let Some(sources) = pulse_sources else {
         return skipped(name);
@@ -1401,7 +1404,8 @@ fn doctor_virtmic_source(name: &str, pulse_sources: Option<&[PulseSourceInfo]>) 
         Some(source) if source.monitor_of.is_some() => check(
             name,
             false,
-            "virtmic является монитором синка — Zoom такие источники фильтрует".to_string(),
+            "virtmic является монитором синка — приложения связи такие источники фильтруют"
+                .to_string(),
         ),
         Some(source) => check(name, true, format!("индекс {}, не монитор", source.index)),
     }
@@ -1478,7 +1482,7 @@ pub fn doctor_with(
     const NAMES_SERVER: &str = "pulse-сервер доступен";
     const NAMES_SINK_MEMES: &str = "синк soundboard присутствует";
     const NAMES_VIRTMIC_SOURCE: &str =
-        "источник virtmic присутствует и не является монитором (виден Zoom)";
+        "источник virtmic присутствует и не является монитором (виден приложениям связи)";
     const NAMES_VIRTMIC_NODE: &str = "нативный узел virtmic присутствует (ровно один)";
     const NAMES_MEMES_LINKS: &str = "связи soundboard:monitor_{FL,FR}->virtmic присутствуют";
     const NAMES_REAL_MIC: &str = "реальный микрофон найден";
@@ -1525,7 +1529,8 @@ pub fn doctor_with(
         &null_sink_args(SINK_MEMES, "Meme_Soundboard"),
     ));
 
-    // Zoom-visibility: source virtmic must exist and not be a monitor.
+    // Conferencing-app visibility: source virtmic must exist and not be a
+    // monitor.
     let sources = backend.sources();
     checks.push(match &sources {
         Ok(sources) => doctor_virtmic_source(NAMES_VIRTMIC_SOURCE, Some(sources)),
@@ -2916,7 +2921,7 @@ virtmic:input_FL
         // server, sink, source-not-monitor, native node, memes links,
         // real mic, mic links
         assert_eq!(report.checks.len(), 7);
-        assert!(report.render().contains(ZOOM_HINT));
+        assert!(report.render().contains(CONF_HINT));
     }
 
     #[test]
@@ -2947,18 +2952,18 @@ virtmic:input_FL
     #[test]
     fn doctor_fails_when_virtmic_source_is_a_monitor() {
         // The regression this doctor check exists for: a monitor source named
-        // virtmic (old broken design) — Zoom would never list it.
+        // virtmic (old broken design) — conferencing apps would never list it.
         let mut backend = clean_pulse_backend().with_source(SOURCE_VIRTMIC, Some(5));
         let mut native = clean_native();
         let cfg = passthroughs_off();
         let report = doctor_with(&mut backend, &mut native, &cfg);
-        let zoom_check = report
+        let vis_check = report
             .checks
             .iter()
             .find(|c| c.name.contains("не является монитором"))
-            .expect("zoom check present");
-        assert!(!zoom_check.passed);
-        assert!(zoom_check.detail.contains("монитором"));
+            .expect("visibility check present");
+        assert!(!vis_check.passed);
+        assert!(vis_check.detail.contains("монитором"));
     }
 
     #[test]
@@ -2967,12 +2972,12 @@ virtmic:input_FL
         let mut native = clean_native();
         let cfg = passthroughs_off();
         let report = doctor_with(&mut backend, &mut native, &cfg);
-        let zoom_check = report
+        let vis_check = report
             .checks
             .iter()
             .find(|c| c.name.contains("не является монитором"))
-            .expect("zoom check present");
-        assert!(!zoom_check.passed);
+            .expect("visibility check present");
+        assert!(!vis_check.passed);
     }
 
     #[test]
