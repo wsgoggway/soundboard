@@ -21,6 +21,15 @@
 //! (not only when it never started), so «Починить граф» — and the
 //! mic-mix/monitoring toggles that trigger a reconcile — heal a frozen or
 //! failed meter without an app restart.
+//!
+//! Readiness protocol: the setup phase sends `Ok(())` over an internal
+//! channel the moment the capture stream is live (BEFORE the pump loop —
+//! the pump itself only terminates when the meter stops), so a healthy
+//! start returns promptly; the timeout in [`MeterHandle::start`] fires only
+//! when the setup genuinely stalls. Because the source may be created
+//! moments before the meter connects (the graph reconciles right before
+//! the meter starts, and the pulse alias appears asynchronously), a failed
+//! connect is retried a bounded number of times with a small backoff.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +49,21 @@ const SEND_INTERVAL: Duration = Duration::from_millis(33);
 const SEND_THRESHOLD: f32 = 0.01;
 /// Poll step of the pump loop.
 const PUMP_STEP: Duration = Duration::from_millis(5);
-/// Upper bound for the stream to become ready.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for one readiness wait (pulse context connect, or the
+/// capture stream reaching the READY state).
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connect attempts for the capture stream when the source is not (yet)
+/// visible: the graph may have created it moments before the meter connects
+/// (the pulse alias of the native node appears asynchronously), so the
+/// first attempt may legitimately fail fast.
+const SOURCE_ATTEMPTS: u32 = 4;
+/// Backoff between capture-stream connect attempts (small, constant).
+const SOURCE_RETRY_DELAY: Duration = Duration::from_millis(300);
+/// Upper bound for the whole blocking [`MeterHandle::start`]: the first
+/// readiness wait may consume the full [`READY_TIMEOUT`] (a stalled server),
+/// while the absent-source retries fail fast (3 × 300 ms backoff ≈ 1 s);
+/// the extra second is slack for the context connect.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(7);
 /// Capture spec requested from the server (it converts from the source's
 /// `float32le 2ch 48000Hz`, contract `docs/pipewire-recipe.md`).
 const CAPTURE_SPEC: Spec = Spec {
@@ -93,10 +115,15 @@ impl MeterHandle {
         let thread = thread::Builder::new()
             .name("soundboard-meter".to_string())
             .spawn(move || {
-                // Only the setup outcome goes back over the channel; a
-                // mid-run failure just ends the thread (see module docs).
-                let outcome = pump(source, tx, Arc::clone(&stop));
-                let _ = ready_tx.send(outcome);
+                // Readiness is delivered from inside `pump` as soon as the
+                // capture stream is live (the pump loop only ends when the
+                // meter stops, i.e. after readiness); only a setup failure
+                // that happened before that still needs to reach the
+                // receiver here.
+                let outcome = pump(source, tx, Arc::clone(&stop), &ready_tx);
+                if outcome.is_err() {
+                    let _ = ready_tx.send(outcome);
+                }
             })
             .context("failed to spawn the meter thread")?;
         match ready_rx.recv_timeout(SETUP_TIMEOUT) {
@@ -136,9 +163,60 @@ impl Drop for MeterHandle {
     }
 }
 
-/// Sets up the pulse connection and capture stream, reports readiness, then
+/// Outcome of one capture-stream connect attempt: [`StreamWait::Ready`],
+/// a retryable [`StreamWait::SourceUnavailable`] (the source may be created
+/// moments before the meter connects) or a [`StreamWait::Fatal`] failure
+/// (no retry would help).
+enum StreamWait {
+    Ready,
+    SourceUnavailable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+/// Pumps the private mainloop until `stream` becomes [`StreamState::Ready`]
+/// (bounded by [`READY_TIMEOUT`]) or the attempt fails: a stream that
+/// entered `Failed`/`Terminated` means the source is not (yet) there
+/// (retryable), anything else is terminal.
+fn wait_stream_ready(stream: &Stream, mainloop: &mut Mainloop, source: &str) -> StreamWait {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return StreamWait::Fatal(anyhow::anyhow!("источник {source} не стал готов вовремя"));
+        }
+        match mainloop.iterate(true) {
+            IterateResult::Success(_) => {}
+            IterateResult::Quit(_) => {
+                return StreamWait::Fatal(anyhow::anyhow!(
+                    "pulse-мэйнлуп завершился при открытии источника"
+                ));
+            }
+            IterateResult::Err(e) => {
+                return StreamWait::Fatal(anyhow::anyhow!(
+                    "ошибка pulse-мэйнлупа при открытии источника: {e}"
+                ));
+            }
+        }
+        match stream.get_state() {
+            StreamState::Ready => return StreamWait::Ready,
+            StreamState::Failed | StreamState::Terminated => {
+                return StreamWait::SourceUnavailable(anyhow::anyhow!(
+                    "источник {source} недоступен (граф не поднят?)"
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Sets up the pulse connection and capture stream (with a bounded retry
+/// for a source that is not up yet), reports readiness over `ready`, then
 /// pumps peaks into `tx` until `stop` is set or the stream dies.
-fn pump(source: String, tx: Sender<f32>, stop: Arc<AtomicBool>) -> Result<()> {
+fn pump(
+    source: String,
+    tx: Sender<f32>,
+    stop: Arc<AtomicBool>,
+    ready: &std::sync::mpsc::Sender<Result<()>>,
+) -> Result<()> {
     // The graph's PulseSession keeps its context private (read-only slice),
     // so the meter connects independently — same recipe, different name.
     let mut mainloop = Mainloop::new().context("не удалось создать pulse-мэйнлуп")?;
@@ -147,7 +225,11 @@ fn pump(source: String, tx: Sender<f32>, stop: Arc<AtomicBool>) -> Result<()> {
     context
         .connect(None, ContextFlags::NOFLAGS, None)
         .map_err(|e| anyhow::anyhow!("не удалось начать pulse-соединение: {e}"))?;
+    let deadline = Instant::now() + READY_TIMEOUT;
     loop {
+        if Instant::now() >= deadline {
+            bail!("pulse-сервер не ответил вовремя");
+        }
         match mainloop.iterate(true) {
             IterateResult::Success(_) => {}
             IterateResult::Quit(_) => bail!("pulse-мэйнлуп завершился при подключении"),
@@ -162,29 +244,44 @@ fn pump(source: String, tx: Sender<f32>, stop: Arc<AtomicBool>) -> Result<()> {
         }
     }
 
-    let mut stream = Stream::new(&mut context, "soundboard-meter", &CAPTURE_SPEC, None)
-        .ok_or_else(|| anyhow::anyhow!("не удалось создать поток захвата"))?;
-    stream
-        .connect_record(Some(&source), None, FlagSet::NOFLAGS)
-        .with_context(|| format!("не удалось подключиться к источнику {source}"))?;
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-    loop {
-        if Instant::now() >= deadline {
-            bail!("источник {source} не стал готов вовремя");
+    // Bounded retry: a fresh source (the graph reconciles right before the
+    // meter starts) may not be visible to the pulse server yet; each failed
+    // attempt returns quickly, so a couple of short backoffs cover the
+    // publication race without delaying a healthy start.
+    let mut stream = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..SOURCE_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(SOURCE_RETRY_DELAY);
         }
-        match mainloop.iterate(true) {
-            IterateResult::Success(_) => {}
-            IterateResult::Quit(_) => bail!("pulse-мэйнлуп завершился при открытии источника"),
-            IterateResult::Err(e) => bail!("ошибка pulse-мэйнлупа при открытии источника: {e}"),
-        }
-        match stream.get_state() {
-            StreamState::Ready => break,
-            StreamState::Failed | StreamState::Terminated => {
-                bail!("источник {source} недоступен (граф не поднят?)")
+        let mut candidate = Stream::new(&mut context, "soundboard-meter", &CAPTURE_SPEC, None)
+            .ok_or_else(|| anyhow::anyhow!("не удалось создать поток захвата"))?;
+        candidate
+            .connect_record(Some(&source), None, FlagSet::NOFLAGS)
+            .with_context(|| format!("не удалось подключиться к источнику {source}"))?;
+        match wait_stream_ready(&candidate, &mut mainloop, &source) {
+            StreamWait::Ready => {
+                stream = Some(candidate);
+                break;
             }
-            _ => {}
+            StreamWait::SourceUnavailable(e) => {
+                let _ = candidate.disconnect();
+                last_err = Some(e);
+            }
+            StreamWait::Fatal(e) => {
+                let _ = candidate.disconnect();
+                return Err(e);
+            }
         }
     }
+    let mut stream = stream.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow::anyhow!("источник {source} недоступен"))
+    })?;
+
+    // The capture stream is live: unblock the blocked `start` (it must not
+    // wait for the pump to END — the pump runs until the meter is stopped),
+    // then enter the pump loop.
+    let _ = ready.send(Ok(()));
 
     let mut last_sent = f32::NAN;
     let mut last_emit = Instant::now();
