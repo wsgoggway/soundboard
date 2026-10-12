@@ -21,14 +21,30 @@
 //! NEVER used on purpose (documented broken variants, see the recipe):
 //! `media.class=Audio/Source/Virtual` null-sinks, `pw-loopback`.
 //!
-//! "Our" modules are identified strictly by module name + arguments:
-//! null-sinks with `sink_name=soundboard|virtmic`, and loopbacks with
-//! `sink=virtmic` or `source=soundboard.monitor`. Anything else — including a
-//! user's own loopback that happens to target `sink=soundboard` — is foreign
-//! and never unloaded.
+//! Ownership is persistent, not heuristic: every module index we load is
+//! recorded in a versioned state file
+//! (`$XDG_STATE_HOME/soundboard/modules.json`, see [`default_state_path`]).
+//!
+//! - A module is OURS iff its index is in that state file AND it still
+//!   exists AND its name still matches the recorded expected name
+//!   (`module-null-sink` / `module-loopback`). Everything else is foreign
+//!   and never unloaded — including a user's own lookalike module we never
+//!   loaded.
+//! - Adoption rule (reconcile/up only): a module shaped like ours but NOT in
+//!   the state file is adopted (added to the state, no reload) iff it carries
+//!   EXACTLY our desired args for its slot (normalized compare); this makes
+//!   `up` a no-op after state-file loss instead of duplicating modules.
+//! - Anything shaped like ours that is neither owned nor adoptable is left
+//!   alone and listed in `Report.warnings` ("foreign loopback on virtmic
+//!   left alone: ...").
+//! - Teardown (down) unloads only state-listed modules; it does not adopt.
+//!   Consequence: after losing the state file while the graph is up, `down`
+//!   leaves the orphaned modules running — run `up` once (it adopts/reloads
+//!   them back into the state), then `down`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context as _, bail};
@@ -49,7 +65,7 @@ pub const SOURCE_MEMES_MONITOR: &str = "soundboard.monitor";
 /// Sink acting as the virtual microphone.
 pub const SINK_VIRTMIC: &str = "virtmic";
 /// Monitor source of [`SINK_VIRTMIC`] — what Zoom selects as "Virtual_Mic".
-/// Contract constant; consumed by the player (M2) and UI (M3).
+/// Contract constant; reserved for the UI (M3) and doctor output.
 #[allow(dead_code)]
 pub const SOURCE_VIRTMIC_MONITOR: &str = "virtmic.monitor";
 /// Human-readable hint appended to `doctor` output.
@@ -92,8 +108,10 @@ impl Slot {
     }
 }
 
-/// Classifies a module into one of our slots; `None` for foreign modules.
-/// Foreign modules must never be unloaded (user's own loopbacks survive).
+/// Shape-classifies a module into one of our slots; `None` for anything else.
+/// This is only the endpoint shape (name + key args): whether such a module
+/// is actually ours is decided by the persisted state (see [`ModuleState`]) —
+/// shape alone must never make a module unloadable.
 fn classify(module: &ModuleInfo) -> Option<Slot> {
     let kv = args_kv(&module.args);
     match module.name.as_str() {
@@ -132,6 +150,121 @@ fn args_kv(args: &str) -> BTreeMap<String, String> {
 /// Whitespace-collapsed form of an args string, for equality checks.
 fn normalize_args(args: &str) -> String {
     args.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Schema version of the module state file; bump on incompatible changes
+/// (older/unknown versions are treated as empty state).
+const STATE_VERSION: u32 = 1;
+
+/// One module recorded as ours in the state file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedModule {
+    /// Module index in the server at load time.
+    pub index: u32,
+    /// Expected module name (guard against pid-style index reuse by an
+    /// unrelated module): `module-null-sink` or `module-loopback`.
+    pub name: String,
+}
+
+/// Persisted registry of the module indices this tool loaded
+/// (`$XDG_STATE_HOME/soundboard/modules.json`, see [`default_state_path`]).
+///
+/// Written after every reconcile/teardown. A missing, corrupt or
+/// unknown-version file is treated as empty state (the graph then re-adopts
+/// exact-args modules on the next `up`; see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleState {
+    /// Schema version, see [`STATE_VERSION`].
+    pub version: u32,
+    /// Modules we loaded and have not unloaded yet.
+    pub modules: Vec<OwnedModule>,
+}
+
+impl ModuleState {
+    /// Empty state (nothing owned yet).
+    #[must_use]
+    pub fn empty() -> Self {
+        ModuleState {
+            version: STATE_VERSION,
+            modules: Vec::new(),
+        }
+    }
+
+    /// True when `m` is ours: its (index, name) pair is recorded, the name is
+    /// one of the module types we load, and the module still has our endpoint
+    /// shape (defense against an index recycled by a same-named foreign
+    /// module).
+    fn is_owned(&self, m: &ModuleInfo) -> bool {
+        (m.name == MODULE_NULL_SINK || m.name == MODULE_LOOPBACK)
+            && classify(m).is_some()
+            && self
+                .modules
+                .iter()
+                .any(|o| o.index == m.index && o.name == m.name)
+    }
+
+    /// Records `m` as ours (adoption or fresh load); no-op when present.
+    fn adopt(&mut self, m: &ModuleInfo) {
+        if !self.modules.iter().any(|o| o.index == m.index) {
+            self.modules.push(OwnedModule {
+                index: m.index,
+                name: m.name.clone(),
+            });
+        }
+    }
+
+    /// Drops the record for `index` (module unloaded).
+    fn remove(&mut self, index: u32) {
+        self.modules.retain(|o| o.index != index);
+    }
+
+    /// Prunes records whose module no longer exists on the server (e.g. the
+    /// pulse server restarted and indices died with it).
+    fn retain_live(&mut self, live_indices: &HashSet<u32>) {
+        self.modules.retain(|o| live_indices.contains(&o.index));
+    }
+
+    /// Loads the state file; a missing, unreadable, corrupt or
+    /// unknown-version file is treated as empty state (never an error: a
+    /// stale registry must not brick the graph commands).
+    #[must_use]
+    pub fn load(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::empty();
+        };
+        match serde_json::from_str::<ModuleState>(&text) {
+            Ok(state) if state.version == STATE_VERSION => state,
+            _ => Self::empty(),
+        }
+    }
+
+    /// Writes the state file, creating parent directories.
+    ///
+    /// # Errors
+    /// Fails when the file cannot be written (the caller surfaces it: without
+    /// a persisted registry the next `down` cannot find our modules).
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create state dir {}", parent.display()))?;
+        }
+        let text =
+            serde_json::to_string_pretty(self).context("failed to serialize module state")?;
+        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+/// Default module state file location:
+/// `$XDG_STATE_HOME/soundboard/modules.json` (typically
+/// `~/.local/state/soundboard/modules.json`).
+///
+/// # Errors
+/// Fails when the XDG state directory cannot be determined.
+pub fn default_state_path() -> anyhow::Result<PathBuf> {
+    let dir = dirs::state_dir().ok_or_else(|| {
+        anyhow::anyhow!("cannot determine the XDG state directory (set XDG_STATE_HOME or HOME)")
+    })?;
+    Ok(dir.join("soundboard").join("modules.json"))
 }
 
 /// One applied change in a [`Report`].
@@ -299,18 +432,62 @@ pub trait PulseBackend {
     fn default_source(&mut self) -> anyhow::Result<Option<String>>;
 }
 
+/// Human-readable warning for a module shaped like ours that we do not own.
+fn foreign_warning(m: &ModuleInfo) -> String {
+    let kv = args_kv(&m.args);
+    if m.name == MODULE_LOOPBACK {
+        if kv.get("sink").map(String::as_str) == Some(SINK_VIRTMIC) {
+            return format!("foreign loopback on {SINK_VIRTMIC} left alone: {}", m.args);
+        }
+        if kv.get("source").map(String::as_str) == Some(SOURCE_MEMES_MONITOR) {
+            return format!(
+                "foreign loopback from {SOURCE_MEMES_MONITOR} left alone: {}",
+                m.args
+            );
+        }
+    }
+    format!("foreign {} left alone: {}", m.name, m.args)
+}
+
 /// Applies the desired state: loads missing modules, unloads+reloads the ones
-/// with wrong args, unloads stale/extra modules of ours. Foreign modules are
-/// never touched.
-pub fn reconcile_with(backend: &mut dyn PulseBackend, cfg: &Config) -> anyhow::Result<Report> {
+/// of ours with wrong args, unloads stale/extra modules of ours. Modules not
+/// owned per the state file are never touched: exact-args lookalikes are
+/// adopted into the state, everything else is foreign and only warned about.
+///
+/// Returns the report and the updated state to persist (pruned of dead
+/// indices, extended by adoptions/loads, shrunk by unloads).
+pub fn reconcile_with(
+    backend: &mut dyn PulseBackend,
+    cfg: &Config,
+    owned: &ModuleState,
+) -> anyhow::Result<(Report, ModuleState)> {
     let mut warnings = Vec::new();
     let desired = desired_state(backend, cfg, &mut warnings)?;
     let current = backend.modules()?;
 
+    let mut state = owned.clone();
+    state.retain_live(&current.iter().map(|m| m.index).collect());
+
     let mut ours_by_slot: BTreeMap<Slot, Vec<ModuleInfo>> = BTreeMap::new();
     for m in current {
-        if let Some(slot) = classify(&m) {
+        let Some(slot) = classify(&m) else {
+            continue; // not our shape at all: never ours, never warned about
+        };
+        if state.is_owned(&m) {
             ours_by_slot.entry(slot).or_default().push(m);
+            continue;
+        }
+        // Shaped like ours but not in the state file: adoptable only with
+        // EXACTLY our desired args for the slot; anything else is foreign.
+        let adoptable = desired
+            .iter()
+            .find(|d| d.slot == slot)
+            .is_some_and(|d| normalize_args(&m.args) == normalize_args(&d.args));
+        if adoptable {
+            state.adopt(&m);
+            ours_by_slot.entry(slot).or_default().push(m);
+        } else {
+            warnings.push(foreign_warning(&m));
         }
     }
 
@@ -335,9 +512,15 @@ pub fn reconcile_with(backend: &mut dyn PulseBackend, cfg: &Config) -> anyhow::R
         }
         for m in existing {
             backend.unload(m.index)?;
+            state.remove(m.index);
             consumed.insert(m.index);
         }
         let index = backend.load(d.module, &d.args)?;
+        state.adopt(&ModuleInfo {
+            index,
+            name: d.module.to_string(),
+            args: d.args.clone(),
+        });
         let action = if existing.is_empty() {
             ChangeAction::Load
         } else {
@@ -356,6 +539,7 @@ pub fn reconcile_with(backend: &mut dyn PulseBackend, cfg: &Config) -> anyhow::R
         for m in modules {
             if consumed.insert(m.index) {
                 backend.unload(m.index)?;
+                state.remove(m.index);
                 report.changes.push(Change {
                     action: ChangeAction::Unload,
                     slot: classify(m)
@@ -368,26 +552,37 @@ pub fn reconcile_with(backend: &mut dyn PulseBackend, cfg: &Config) -> anyhow::R
         }
     }
 
-    Ok(report)
+    Ok((report, state))
 }
 
-/// Unloads every module of ours; foreign modules survive.
-pub fn teardown_with(backend: &mut dyn PulseBackend) -> anyhow::Result<Report> {
+/// Unloads every module listed in the state file; everything else — foreign
+/// modules and stateless lookalikes — survives (see the module docs for the
+/// recovery path after state-file loss).
+///
+/// Returns the report and the updated state to persist.
+pub fn teardown_with(
+    backend: &mut dyn PulseBackend,
+    owned: &ModuleState,
+) -> anyhow::Result<(Report, ModuleState)> {
     let current = backend.modules()?;
+    let mut state = owned.clone();
+    state.retain_live(&current.iter().map(|m| m.index).collect());
     let mut report = Report::default();
-    for m in current {
-        if let Some(slot) = classify(&m) {
+    for m in &current {
+        if state.is_owned(m) {
             backend.unload(m.index)?;
+            state.remove(m.index);
             report.changes.push(Change {
                 action: ChangeAction::Unload,
-                slot: slot.label().to_string(),
+                slot: classify(m)
+                    .map_or_else(|| "<unknown>".to_string(), |s| s.label().to_string()),
                 module: m.name.clone(),
                 args: m.args.clone(),
                 index: None,
             });
         }
     }
-    Ok(report)
+    Ok((report, state))
 }
 
 /// One doctor check result.
@@ -601,29 +796,47 @@ pub fn doctor_with(backend: &mut dyn PulseBackend, cfg: &Config) -> DoctorReport
     DoctorReport { checks }
 }
 
-/// Facade over a [`PulseBackend`] implementing the graph operations.
+/// Facade over a [`PulseBackend`] implementing the graph operations. Owns the
+/// module state file: loads it before and persists it after every mutation.
 pub struct Graph<B: PulseBackend> {
     backend: B,
+    state_path: PathBuf,
 }
 
 impl<B: PulseBackend> Graph<B> {
-    /// Wraps a backend.
+    /// Wraps a backend, persisting module ownership at `state_path`
+    /// (see [`default_state_path`]).
     #[must_use]
-    pub fn new(backend: B) -> Self {
-        Graph { backend }
+    pub fn new(backend: B, state_path: PathBuf) -> Self {
+        Graph {
+            backend,
+            state_path,
+        }
     }
 
-    /// Idempotent desired-state reconcile (see [`reconcile_with`]).
+    /// Idempotent desired-state reconcile (see [`reconcile_with`]); the
+    /// module state file is reloaded first and rewritten after.
+    ///
+    /// # Errors
+    /// Also fails when the state file cannot be persisted after a successful
+    /// reconcile (the next `down` would not find our modules otherwise).
     pub fn reconcile(&mut self, cfg: &Config) -> anyhow::Result<Report> {
-        reconcile_with(&mut self.backend, cfg)
+        let owned = ModuleState::load(&self.state_path);
+        let (report, state) = reconcile_with(&mut self.backend, cfg, &owned)?;
+        state.save(&self.state_path)?;
+        Ok(report)
     }
 
-    /// Removes all our modules (see [`teardown_with`]).
+    /// Removes all our modules (see [`teardown_with`]); persists the state.
     pub fn teardown(&mut self) -> anyhow::Result<Report> {
-        teardown_with(&mut self.backend)
+        let owned = ModuleState::load(&self.state_path);
+        let (report, state) = teardown_with(&mut self.backend, &owned)?;
+        state.save(&self.state_path)?;
+        Ok(report)
     }
 
-    /// Diagnostics (see [`doctor_with`]).
+    /// Diagnostics (see [`doctor_with`]); read-only, never adopts or mutates
+    /// the state.
     pub fn doctor(&mut self, cfg: &Config) -> DoctorReport {
         doctor_with(&mut self.backend, cfg)
     }
@@ -888,12 +1101,30 @@ mod tests {
         }
     }
 
+    /// State marking every module currently in the backend as ours.
+    fn seed_state(backend: &mut MockBackend) -> ModuleState {
+        let modules = backend.modules().expect("modules");
+        ModuleState {
+            version: STATE_VERSION,
+            modules: modules
+                .into_iter()
+                .map(|m| OwnedModule {
+                    index: m.index,
+                    name: m.name,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn clean_state_reconcile_is_noop() {
         let mut backend = clean_sinks_backend();
-        let report = reconcile_with(&mut backend, &passthroughs_off()).expect("reconcile");
+        let owned = seed_state(&mut backend);
+        let (report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
         assert!(report.is_noop(), "expected no changes, got: {report:?}");
         assert_eq!(backend.modules().expect("modules").len(), 3);
+        assert_eq!(state, owned);
     }
 
     #[test]
@@ -901,20 +1132,30 @@ mod tests {
         let mut backend = MockBackend::new(Some("alsa_output.real"), Some("alsa_input.real"))
             .with_module(MODULE_NULL_SINK, &memes_sink_args())
             .with_module(MODULE_NULL_SINK, &virtmic_sink_args());
-        let report = reconcile_with(&mut backend, &passthroughs_off()).expect("reconcile");
+        let owned = seed_state(&mut backend);
+        let (report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
         assert_eq!(report.changes.len(), 1);
         assert_eq!(report.changes[0].action, ChangeAction::Load);
         assert_eq!(report.changes[0].slot, Slot::LoopbackMemes.label());
         let modules = backend.modules().expect("modules");
-        assert!(modules.iter().any(|m| m.name == MODULE_LOOPBACK
-            && normalize_args(&m.args)
-                == normalize_args(&loopback_args(SOURCE_MEMES_MONITOR, SINK_VIRTMIC))));
+        let loaded = modules
+            .iter()
+            .find(|m| m.name == MODULE_LOOPBACK)
+            .expect("loaded loopback");
+        assert_eq!(
+            normalize_args(&loaded.args),
+            normalize_args(&loopback_args(SOURCE_MEMES_MONITOR, SINK_VIRTMIC))
+        );
+        // The new module is recorded in the returned state.
+        assert!(state.modules.iter().any(|o| o.index == loaded.index));
     }
 
     #[test]
     fn loopback_with_wrong_args_is_reloaded() {
         // Sinks only + a memes-slot loopback with extra args: the slot holds
-        // exactly one wrong-args module, so it must be unloaded and reloaded.
+        // exactly one wrong-args module of ours, so it must be unloaded and
+        // reloaded.
         let mut backend = MockBackend::new(Some("alsa_output.real"), Some("alsa_input.real"))
             .with_module(MODULE_NULL_SINK, &memes_sink_args())
             .with_module(MODULE_NULL_SINK, &virtmic_sink_args())
@@ -925,7 +1166,9 @@ mod tests {
                     loopback_args(SOURCE_MEMES_MONITOR, SINK_VIRTMIC)
                 ),
             );
-        let report = reconcile_with(&mut backend, &passthroughs_off()).expect("reconcile");
+        let owned = seed_state(&mut backend);
+        let (report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
         assert_eq!(report.changes.len(), 1);
         assert_eq!(report.changes[0].action, ChangeAction::Reload);
         let modules = backend.modules().expect("modules");
@@ -938,17 +1181,26 @@ mod tests {
             normalize_args(&loopbacks[0].args),
             normalize_args(&loopback_args(SOURCE_MEMES_MONITOR, SINK_VIRTMIC))
         );
+        // The reloaded module replaced the old record in the state.
+        assert_eq!(state.modules.len(), 3);
+        assert!(
+            state
+                .modules
+                .iter()
+                .any(|o| o.index == loopbacks[0].index && o.name == MODULE_LOOPBACK)
+        );
     }
 
     #[test]
     fn mic_mix_loopback_follows_default_mic() {
         let mut backend = clean_sinks_backend();
+        let owned = seed_state(&mut backend);
         let cfg = Config {
             mic_mix: true,
             monitoring: false,
             ..Config::default()
         };
-        let report = reconcile_with(&mut backend, &cfg).expect("reconcile");
+        let (report, _state) = reconcile_with(&mut backend, &cfg, &owned).expect("reconcile");
         assert!(report.warnings.is_empty());
         let modules = backend.modules().expect("modules");
         assert!(modules.iter().any(|m| m.name == MODULE_LOOPBACK
@@ -959,13 +1211,14 @@ mod tests {
     #[test]
     fn mic_mix_with_monitor_default_source_warns_and_skips() {
         let mut backend = clean_sinks_backend();
+        let owned = seed_state(&mut backend);
         backend.default_source = Some("soundboard.monitor".to_string());
         let cfg = Config {
             mic_mix: true,
             monitoring: false,
             ..Config::default()
         };
-        let report = reconcile_with(&mut backend, &cfg).expect("reconcile");
+        let (report, _state) = reconcile_with(&mut backend, &cfg, &owned).expect("reconcile");
         assert_eq!(report.warnings.len(), 1);
         // Nothing new was created: only the three always-on modules remain.
         assert_eq!(backend.modules().expect("modules").len(), 3);
@@ -974,13 +1227,13 @@ mod tests {
     #[test]
     fn monitoring_loopback_targets_default_sink() {
         let mut backend = clean_sinks_backend();
+        let owned = seed_state(&mut backend);
         let cfg = Config {
             mic_mix: false,
             monitoring: true,
             ..Config::default()
         };
-        let report = reconcile_with(&mut backend, &cfg).expect("reconcile");
-        assert!(report.warnings.is_empty());
+        let (_report, _state) = reconcile_with(&mut backend, &cfg, &owned).expect("reconcile");
         assert!(
             backend
                 .modules()
@@ -998,20 +1251,30 @@ mod tests {
     #[test]
     fn stale_extra_ours_module_is_unloaded() {
         // clean_sinks_backend already carries the exact memes loopback; the
-        // extra module below is a duplicate in the same slot.
+        // extra module below is a state-listed duplicate in the same slot.
         let mut backend = clean_sinks_backend().with_module(
             MODULE_LOOPBACK,
             &loopback_args(SOURCE_MEMES_MONITOR, SINK_VIRTMIC),
         );
-        let report = reconcile_with(&mut backend, &passthroughs_off()).expect("reconcile");
+        let owned = seed_state(&mut backend);
+        let (report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
         assert_eq!(report.changes.len(), 1);
         assert_eq!(report.changes[0].action, ChangeAction::Unload);
+        let loopbacks: Vec<_> = backend
+            .modules()
+            .expect("modules")
+            .iter()
+            .filter(|m| m.name == MODULE_LOOPBACK)
+            .cloned()
+            .collect();
+        assert_eq!(loopbacks.len(), 1);
+        // Exactly one loopback record remains in the state.
         assert_eq!(
-            backend
-                .modules()
-                .expect("modules")
+            state
+                .modules
                 .iter()
-                .filter(|m| m.name == MODULE_LOOPBACK)
+                .filter(|o| o.name == MODULE_LOOPBACK)
                 .count(),
             1
         );
@@ -1019,11 +1282,15 @@ mod tests {
 
     #[test]
     fn disabled_mic_mix_unloads_stale_mic_loopback() {
+        // The mic loopback IS in the state (we loaded it while mic_mix was
+        // on), so turning mic_mix off unloads it.
         let mut backend = clean_sinks_backend().with_module(
             MODULE_LOOPBACK,
             &loopback_args("alsa_input.real", SINK_VIRTMIC),
         );
-        let report = reconcile_with(&mut backend, &passthroughs_off()).expect("reconcile");
+        let owned = seed_state(&mut backend);
+        let (report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
         assert_eq!(report.changes.len(), 1);
         assert_eq!(report.changes[0].action, ChangeAction::Unload);
         assert!(
@@ -1035,13 +1302,22 @@ mod tests {
                     && normalize_args(&m.args)
                         == normalize_args(&loopback_args("alsa_input.real", SINK_VIRTMIC)))
         );
+        assert!(
+            !state
+                .modules
+                .iter()
+                .any(|o| o.name == MODULE_LOOPBACK && o.index == 3)
+        );
     }
 
     #[test]
     fn foreign_loopback_is_untouched() {
         let foreign = loopback_args("alsa_input.real", "alsa_output.real");
         let mut backend = clean_sinks_backend().with_module(MODULE_LOOPBACK, &foreign);
-        reconcile_with(&mut backend, &passthroughs_off()).expect("reconcile");
+        let owned = seed_state(&mut backend);
+        let (report, _state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
+        assert!(report.is_noop());
         assert!(
             backend
                 .modules()
@@ -1052,11 +1328,139 @@ mod tests {
     }
 
     #[test]
+    fn foreign_lookalike_loopback_survives_up_and_down() {
+        // A module-loopback on virtmic that we never loaded (absent from the
+        // state) with DIFFERENT args: never adopted, never unloaded; `up`
+        // warns, `down` leaves it alone.
+        let lookalike = format!(
+            "{} latency_msec=50",
+            loopback_args("alsa_input.real", SINK_VIRTMIC)
+        );
+        let mut backend = clean_sinks_backend().with_module(MODULE_LOOPBACK, &lookalike);
+        let ours = {
+            // Seed only the three always-on modules; the lookalike (index 3)
+            // stays unowned.
+            let all = seed_state(&mut backend);
+            ModuleState {
+                version: STATE_VERSION,
+                modules: all.modules.into_iter().take(3).collect(),
+            }
+        };
+        // up
+        let (up_report, up_state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &ours).expect("reconcile");
+        assert!(
+            up_report.warnings.iter().any(|w| {
+                w.starts_with("foreign loopback on virtmic left alone") && w.contains(&lookalike)
+            }),
+            "expected a foreign-loopback warning, got: {up_report:?}"
+        );
+        assert!(
+            backend
+                .modules()
+                .expect("modules")
+                .iter()
+                .any(|m| m.args == lookalike),
+            "foreign lookalike must survive up"
+        );
+        // The lookalike (index 3) was never adopted into the state.
+        assert!(!up_state.modules.iter().any(|o| o.index == 3));
+        // down
+        let (down_report, down_state) = teardown_with(&mut backend, &up_state).expect("teardown");
+        assert_eq!(down_report.changes.len(), 3);
+        assert!(down_state.modules.is_empty());
+        let rest = backend.modules().expect("modules");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(
+            rest[0].args, lookalike,
+            "foreign lookalike must survive down"
+        );
+    }
+
+    #[test]
+    fn exact_args_loopback_after_state_loss_is_adopted_not_duplicated() {
+        // Clean graph, empty state (state file lost): reconcile must adopt
+        // all three exact-args modules into a fresh state, change nothing on
+        // the server, and the adopted state must then drive teardown.
+        let mut backend = clean_sinks_backend();
+        let (report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &ModuleState::empty())
+                .expect("reconcile");
+        assert!(
+            report.is_noop(),
+            "adoption must be a no-op, got: {report:?}"
+        );
+        assert!(report.warnings.is_empty());
+        assert_eq!(backend.modules().expect("modules").len(), 3);
+        assert_eq!(state.modules.len(), 3);
+        let (down_report, down_state) = teardown_with(&mut backend, &state).expect("teardown");
+        assert_eq!(down_report.changes.len(), 3);
+        assert!(down_state.modules.is_empty());
+        assert!(backend.modules().expect("modules").is_empty());
+    }
+
+    #[test]
+    fn stale_state_indices_are_pruned() {
+        let mut backend = clean_sinks_backend();
+        let mut owned = seed_state(&mut backend);
+        // A dead record: the pulse server restarted, index 99 is gone.
+        owned.modules.push(OwnedModule {
+            index: 99,
+            name: MODULE_LOOPBACK.to_string(),
+        });
+        let (_report, state) =
+            reconcile_with(&mut backend, &passthroughs_off(), &owned).expect("reconcile");
+        assert!(!state.modules.iter().any(|o| o.index == 99));
+        assert_eq!(state.modules.len(), 3);
+    }
+
+    #[test]
+    fn state_file_missing_corrupt_or_unknown_version_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Missing.
+        assert_eq!(
+            ModuleState::load(&dir.path().join("absent.json")),
+            ModuleState::empty()
+        );
+        // Corrupt.
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "{not json").expect("write");
+        assert_eq!(ModuleState::load(&corrupt), ModuleState::empty());
+        // Wrong schema version.
+        let old = dir.path().join("old.json");
+        std::fs::write(&old, r#"{"version": 999, "modules": []}"#).expect("write");
+        assert_eq!(ModuleState::load(&old), ModuleState::empty());
+        // Valid file round-trips.
+        let good = dir.path().join("nested").join("modules.json");
+        let state = ModuleState {
+            version: STATE_VERSION,
+            modules: vec![OwnedModule {
+                index: 7,
+                name: MODULE_NULL_SINK.to_string(),
+            }],
+        };
+        state.save(&good).expect("save creates parent dirs");
+        assert_eq!(ModuleState::load(&good), state);
+    }
+
+    #[test]
     fn teardown_removes_exactly_ours() {
         let foreign = loopback_args("alsa_input.real", "alsa_output.real");
         let mut backend = clean_sinks_backend().with_module(MODULE_LOOPBACK, &foreign);
-        let report = teardown_with(&mut backend).expect("teardown");
+        // Seed only the three always-on modules as ours (that is what the
+        // state records in reality); the foreign loopback (index 3) stays
+        // unowned even though a buggy seed would list it.
+        let owned = ModuleState {
+            version: STATE_VERSION,
+            modules: seed_state(&mut backend)
+                .modules
+                .into_iter()
+                .take(3)
+                .collect(),
+        };
+        let (report, state) = teardown_with(&mut backend, &owned).expect("teardown");
         assert_eq!(report.changes.len(), 3);
+        assert!(state.modules.is_empty());
         let modules = backend.modules().expect("modules");
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].args, foreign);
@@ -1157,17 +1561,23 @@ mod tests {
     }
 
     #[test]
-    fn graph_facade_delegates() {
-        let backend = clean_sinks_backend();
-        let mut graph = Graph::new(backend);
+    fn graph_facade_delegates_and_persists_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state").join("modules.json");
+        let mut graph = Graph::new(clean_sinks_backend(), state_path.clone());
+        // State file absent: the first reconcile adopts the exact-args
+        // modules and persists them.
         assert!(
             graph
                 .reconcile(&passthroughs_off())
                 .expect("reconcile")
                 .is_noop()
         );
+        assert!(state_path.exists(), "state file must be persisted");
         assert!(graph.doctor(&passthroughs_off()).all_passed());
         let torn = graph.teardown().expect("teardown");
         assert_eq!(torn.changes.len(), 3);
+        // After teardown the persisted state is empty.
+        assert_eq!(ModuleState::load(&state_path), ModuleState::empty());
     }
 }

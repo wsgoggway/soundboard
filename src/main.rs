@@ -4,10 +4,11 @@
 //! `soundboard` with no subcommand is the GUI placeholder (the GTK4 UI lands
 //! in a later milestone).
 //!
-//! `play`/`stop` auto-reconcile the audio graph first (auto-setup
-//! everywhere): if the graph cannot come up, they fail and print the
-//! `doctor` report as a hint. `list` only reads the clips directory and
-//! never touches the audio session.
+//! `play` auto-reconciles the audio graph first (auto-setup): if the graph
+//! cannot come up, play fails and prints the `doctor` report as a hint.
+//! `stop` reconciles best-effort — it works from `/proc` alone, so an
+//! unreachable pulse server only produces a warning. `list` only reads the
+//! clips directory and never touches the audio session.
 
 mod cli;
 mod clips;
@@ -38,10 +39,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// Connects to the pulse server and builds the graph facade with the default
+/// module state path.
+fn open_graph() -> Result<Graph<PulseSession>> {
+    let session = PulseSession::connect("soundboard")?;
+    let state_path = graph::default_state_path()?;
+    Ok(Graph::new(session, state_path))
+}
+
 /// Reconciles the audio graph so playback has somewhere to go; on failure
 /// prints the doctor report to stderr as a hint, then returns the error.
 fn ensure_graph(cfg: &Config) -> Result<()> {
-    let mut graph = Graph::new(PulseSession::connect("soundboard")?);
+    let mut graph = open_graph()?;
     match graph.reconcile(cfg) {
         Ok(report) => {
             if !report.is_noop() {
@@ -71,21 +80,18 @@ fn run() -> Result<ExitCode> {
         }
         Some(Commands::Up) => {
             let cfg = Config::load().context("failed to load config")?;
-            let mut graph = Graph::new(PulseSession::connect("soundboard")?);
-            let report = graph.reconcile(&cfg)?;
+            let report = open_graph()?.reconcile(&cfg)?;
             println!("{}", report.summary());
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Down) => {
-            let mut graph = Graph::new(PulseSession::connect("soundboard")?);
-            let report = graph.teardown()?;
+            let report = open_graph()?.teardown()?;
             println!("{}", report.summary());
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Doctor) => {
             let cfg = Config::load().context("failed to load config")?;
-            let mut graph = Graph::new(PulseSession::connect("soundboard")?);
-            let report = graph.doctor(&cfg);
+            let report = open_graph()?.doctor(&cfg);
             println!("{}", report.render());
             Ok(if report.all_passed() {
                 ExitCode::SUCCESS
@@ -133,7 +139,19 @@ fn run() -> Result<ExitCode> {
                 }
                 None => None,
             };
-            ensure_graph(&cfg)?;
+            // Stopping works from /proc alone, so the graph reconcile here is
+            // best-effort: `soundboard stop` must also work while the pulse
+            // server is down (no doctor dump — that is play's job).
+            match open_graph().and_then(|mut graph| graph.reconcile(&cfg)) {
+                Ok(report) => {
+                    if !report.is_noop() {
+                        println!("{}", report.summary());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: graph not reconciled, stopping anyway: {e:#}");
+                }
+            }
             let stopped = PwCatPlayer::stop_external(clip_path.as_deref())?;
             match (&name, stopped) {
                 (Some(clip_name), 0) => println!("{clip_name} is not playing"),
