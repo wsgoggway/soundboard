@@ -8,8 +8,7 @@ microphone and plays short meme audio clips into it.
 - Rust (stable via mise; currently rustc 1.97.0 — mise's `rust` is a symlink
   backend to the rustup toolchain in `~/.cargo/bin`, pinned as `stable` in
   `mise.toml`).
-- CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`/
-  `hotkeys`;
+- CLI (done, M1–M2): clap (derive) — `up`/`down`/`doctor`/`list`/`play`/`stop`;
   graph reconcile over the PulseAudio/PipeWire session via
   `libpulse-binding`; playback via a `pw-cat` subprocess (`PwCatPlayer`,
   cross-process stop through `/proc`); clips registry + per-clip-interrupt
@@ -55,7 +54,7 @@ microphone and plays short meme audio clips into it.
 
 Toolchains come via mise only; never install system packages.
 
-## Layout (plan)
+## Layout
 
 - `src/main.rs` — entry point (clap parse, app bootstrap)
 - `src/cli.rs` — clap definitions
@@ -71,6 +70,8 @@ Toolchains come via mise only; never install system packages.
 
 ## Docs
 
+- `README.md` — user-facing overview: install, quick start, CLI reference,
+  troubleshooting, manual e2e checklist.
 - `docs/pipewire-recipe.md` — CONTRACT for M1: the live-verified PipeWire
   module recipe (exact commands, node names, teardown).
 - `docs/kde-hotkeys.md` — CONTRACT for M4: how Plasma 6 registers command
