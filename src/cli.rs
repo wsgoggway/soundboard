@@ -22,4 +22,16 @@ pub enum Commands {
     Down,
     /// Verify the audio graph state; exit code 1 when problems are found.
     Doctor,
+    /// List clips found in the configured clips directory.
+    List,
+    /// Start playing a clip (non-blocking; auto-reconciles the graph first).
+    Play {
+        /// Clip name: exact, unique case-insensitive or unique prefix.
+        name: String,
+    },
+    /// Stop playing; without NAME stops everything (auto-reconciles first).
+    Stop {
+        /// Clip name to stop; omit to stop all playbacks.
+        name: Option<String>,
+    },
 }
