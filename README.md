@@ -19,6 +19,12 @@ microphone: Zoom, Google Meet, Telegram, Jitsi, Discord, …
   board, «Настройки», «Дебаг»): clip grid with playing highlight, live VU
   meter, volume, mic-mix / hear-yourself / re-click-interrupt toggles, a
   failure banner that jumps to the debug view, error toasts.
+- System tray presence (Plasma StatusNotifierItem via `ksni`): closing the
+  window hides it to the tray while the app keeps running — the audio
+  graph, the meter and hotkey-spawned clips stay alive; the tray menu has
+  «Показать/Скрыть окно», «Стоп всё», a graph-status line and «Выход»
+  (graceful shutdown, then exit). Launching a second instance just raises
+  (and un-hides) the existing window.
 - CLI playback (`play`/`stop`) that works across processes, including
   stopping playbacks started by an earlier command.
 - Per-clip interrupt or overlap playback modes; clips auto-rescan from disk.
@@ -120,6 +126,20 @@ keys / malformed values → error):
 Ownership is tracked in `$XDG_STATE_HOME/soundboard/modules.json`
 (schema v2: pulse module indices + native node ids, typically
 `~/.local/state/soundboard/modules.json`).
+
+## Tray
+
+Closing the window (the [X] button) hides it to the system tray — the app
+keeps running: the PipeWire graph stays up, the VU meter keeps metering and
+hotkey-spawned `soundboard play` processes keep working. A toast reminds
+you the app stayed in the tray. Reopen from the tray menu
+(«Показать/Скрыть окно», or a left click on the icon) or by launching
+`soundboard` again. Real quit only via the tray menu «Выход» (or
+SIGINT/SIGTERM): both go through the graceful shutdown path — config is
+saved, playbacks and meter are stopped, the graph stays up for the
+conferencing app. The tray item requires a StatusNotifierItem-capable shell
+(Plasma provides one); without it the app falls back to windowed mode where
+closing the window quits.
 
 ## Hotkeys
 

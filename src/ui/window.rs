@@ -34,6 +34,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use super::kglobalaccel;
+use super::tray;
 use super::worker::{GuiMsg, SharedConfig, Worker, WorkerCmd, lock_config};
 use crate::clips::Clips;
 use crate::config::Config;
@@ -389,13 +390,17 @@ impl ClipGrid {
 
 /// Builds the window, wires the worker channels and presents it. The
 /// returned window is owned by the application once presented; the caller
-/// may drop the handle.
+/// may drop the handle. `tray` is the system tray handle (empty when the
+/// tray is unavailable — then closing the window really quits); `tray_rx`
+/// carries the tray menu commands drained on the main loop.
 pub(crate) fn build(
     app: &adw::Application,
     ui_rx: Receiver<GuiMsg>,
     meter_rx: Receiver<f32>,
     worker: &Worker,
     cfg: &SharedConfig,
+    tray: Rc<RefCell<Option<tray::TrayHandle>>>,
+    tray_rx: Receiver<tray::TrayCmd>,
 ) -> adw::ApplicationWindow {
     let current = lock_config(cfg).clone();
 
@@ -728,7 +733,7 @@ pub(crate) fn build(
                         &toast_overlay,
                         &format!(
                             "Хоткеи записаны, но Plasma их не перечитала: {e:#} — \
-                                 перелогиньтесь, чтобы они заработали"
+                             перелогиньтесь, чтобы они заработали"
                         ),
                     );
                 }
@@ -851,6 +856,7 @@ pub(crate) fn build(
     let worker_rx = worker.clone();
     let cfg_rx = cfg.clone();
     let toast_rx = toast_overlay.clone();
+    let tray_rx_handle = tray.clone();
     glib::spawn_future_local(async move {
         while let Ok(msg) = ui_rx.recv().await {
             match msg {
@@ -867,6 +873,11 @@ pub(crate) fn build(
                     banner_rx.set_revealed(!report.all_passed());
                     grid_rx.reload(&lock_config(&cfg_rx), &worker_rx);
                     hotkeys_rx.refresh(&lock_config(&cfg_rx));
+                    // Mirror the graph status into the tray menu line.
+                    if let Some(handle) = tray_rx_handle.borrow().as_ref() {
+                        let ok = report.all_passed();
+                        let _ = handle.update(move |state| state.graph_ok = ok);
+                    }
                 }
                 GuiMsg::GraphUp(report) => {
                     set_summary(
@@ -889,7 +900,16 @@ pub(crate) fn build(
                     set_summary(&summary_rx, &format!("Ошибка: {text}"), Some(false));
                     show_toast(&toast_rx, &format!("Ошибка: {text}"));
                 }
-                GuiMsg::ShutdownComplete => window_rx.destroy(),
+                GuiMsg::ShutdownComplete => {
+                    // Remove the tray icon before the window goes away (the
+                    // quit path may already have shut the service down).
+                    if let Some(handle) = tray_rx_handle.borrow().as_ref()
+                        && !handle.is_closed()
+                    {
+                        let _ = handle.shutdown();
+                    }
+                    window_rx.destroy();
+                }
             }
         }
     });
@@ -901,19 +921,64 @@ pub(crate) fn build(
         }
     });
 
-    // Graceful shutdown: keep the window until the worker confirms cleanup
-    // (config saved, meter stopped, playbacks stopped); the graph stays up
-    // for the conferencing app. SIGINT/SIGTERM route through this same
-    // close-request path.
+    // Window close: with a tray present, [X] only hides the window (the
+    // app keeps running: graph, meter, hotkey-spawned plays); a real quit
+    // is the tray «Выход» (or a signal, or closing without any tray).
+    // Quitting keeps the window until the worker confirms cleanup (config
+    // saved, meter stopped, playbacks stopped) — the graph stays up for the
+    // conferencing app.
+    let quit_requested = Rc::new(std::cell::Cell::new(false));
     {
         let worker = worker.clone();
+        let quit = quit_requested.clone();
+        let toast_overlay = toast_overlay.clone();
+        let window_close = window.clone();
+        let has_tray = tray.borrow().is_some();
         window.connect_close_request(move |_window| {
-            worker.send(WorkerCmd::Shutdown);
+            if quit.get() || !has_tray {
+                worker.send(WorkerCmd::Shutdown);
+            } else {
+                // The toast surfaces on the next reveal (within its 6 s
+                // timeout) — toasts of a hidden window are invisible, but
+                // the call must stay non-blocking and cheap.
+                show_toast(&toast_overlay, "Приложение осталось в трее");
+                window_close.set_visible(false);
+            }
             glib::Propagation::Stop
         });
     }
 
-    install_signal_close_poll(&window);
+    // Tray menu commands: never touch GTK from the ksni thread — this drain
+    // loop runs on the main loop.
+    {
+        let window = window.clone();
+        let toast_overlay = toast_overlay.clone();
+        let quit = quit_requested.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(cmd) = tray_rx.recv().await {
+                match cmd {
+                    tray::TrayCmd::ToggleWindow => {
+                        if window.is_visible() {
+                            show_toast(&toast_overlay, "Приложение осталось в трее");
+                            window.set_visible(false);
+                        } else {
+                            window.present();
+                        }
+                    }
+                    tray::TrayCmd::Quit => {
+                        // Same graceful path as SIGINT/SIGTERM: close-request
+                        // sends WorkerCmd::Shutdown, the worker confirms via
+                        // ShutdownComplete and the window is destroyed; the
+                        // tray icon goes first so it never outlives the app.
+                        quit.set(true);
+                        window.close();
+                    }
+                }
+            }
+        });
+    }
+
+    install_signal_close_poll(&window, quit_requested);
 
     // Build the grid right away instead of waiting for the first worker
     // report (scan is a cheap readdir); the hotkey section state comes from
@@ -940,12 +1005,12 @@ extern "C" fn on_close_signal(_signum: libc::c_int) {
 }
 
 /// Registers SIGINT/SIGTERM handlers and a main-loop poll that routes them
-/// through the same shutdown path as clicking the window's [X]
-/// (`window.close()` → close-request → `WorkerCmd::Shutdown` → worker stops
-/// meter + playbacks → `ShutdownComplete` → window destroyed, exit 0; the
-/// graph stays up). Raw libc FFI follows the recorded unsafe ADR (same
-/// precedent as `player.rs`'s `kill`).
-fn install_signal_close_poll(window: &adw::ApplicationWindow) {
+/// through the same shutdown path as the tray «Выход» (`window.close()` →
+/// close-request → `WorkerCmd::Shutdown` → worker stops meter + playbacks →
+/// `ShutdownComplete` → window destroyed, exit 0; the graph stays up).
+/// Raw libc FFI follows the recorded unsafe ADR (same precedent as
+/// `player.rs`'s `kill`).
+fn install_signal_close_poll(window: &adw::ApplicationWindow, quit: Rc<std::cell::Cell<bool>>) {
     for signum in [libc::SIGINT, libc::SIGTERM] {
         // Safety: `libc::signal` only registers the handler; the handler
         // itself performs a single async-signal-safe atomic store.
@@ -956,6 +1021,7 @@ fn install_signal_close_poll(window: &adw::ApplicationWindow) {
     let window = window.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
         if SIGNAL_CLOSE_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            quit.set(true);
             window.close();
             glib::ControlFlow::Break
         } else {

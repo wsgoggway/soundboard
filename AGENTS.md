@@ -26,8 +26,12 @@ Jitsi, Discord, …).
   touches foreign files or `kglobalshortcutsrc`). The GUI «Настройки» view
   manages the same files in-process: registration-state scan
   (`compare_registration`/`read_managed_files`), enable/refresh via the same
-  `write_desktop_files` path + `kbuildsycoca6`, marker-checked removal.
-  Design + sources: `docs/kde-hotkeys.md`.
+  `write_desktop_files` path + live refresh (`src/ui/kglobalaccel.rs`:
+  kglobalacceld never reloads an existing component — the hide/restore +
+  double-`kbuildsycoca6` dance; also used by CLI `--write`),
+  marker-checked removal.
+  Design + sources: `docs/kde-hotkeys.md` (incl. the stale-Exec trap and
+  the D-Bus verification recipe).
 - Module/node ownership state: `$XDG_STATE_HOME/soundboard/modules.json`
   (schema v2) records the pulse module indices and native node ids we
   created (see `src/graph.rs`); native matching is by `node.name`/port
@@ -51,7 +55,12 @@ Jitsi, Discord, …).
   main-loop poll → the same close-request path — glib 0.22 has no unix
   signal sources). M5: the window is a three-page `gtk::Stack`
   («Саундборд» / «Настройки» / «Дебаг») switched by a `StackSwitcher` in
-  the HeaderBar (NOT a Notebook); «Саундборд» = grid + stop-all + volume +
+  the HeaderBar (NOT a Notebook); M6: system tray presence —
+  `src/ui/tray.rs` (ksni 0.3, `blocking` feature: StatusNotifierItem on
+  its own thread, menu actions only send `tray::TrayCmd`s to the main
+  loop); closing the window hides to the tray (app keeps running), quit
+  via tray «Выход»/signals through the same graceful path; second launch
+  presents the existing window (gio single-instance); «Саундборд» = grid + stop-all + volume +
   VU meter + CONF_HINT, «Настройки» = toggles + «Глобальные хоткеи»
   management + clips-dir row (xdg-open), «Дебаг» = doctor checks with their
   detail lines inline + repair buttons; a window-level `AdwBanner` shows
