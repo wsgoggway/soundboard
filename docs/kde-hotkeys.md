@@ -99,7 +99,9 @@ X-KDE-Shortcuts=Alt+N
   desktop file — `kglobalshortcutsrc` stays untouched (override entries are
   only needed for non-default keys).
 - Discovery goes through ksycoca (path 2 above): `Exec` uses the bare
-  `soundboard` command, so it must stay on the user's `PATH`.
+  the absolute path of the running soundboard binary (via `current_exe()`),
+  so hotkeys do not depend on the session `PATH`. Re-run registration after
+  moving or reinstalling the binary to a different location.
 - `Exec` escaping per the Desktop Entry Specification: the whole clip name is
   one double-quoted argument; inside quotes `\`, `"`, `` ` ``, `$` are
   backslash-escaped and literal newlines/tabs/CRs use the `\n`/`\t`/`\r`

@@ -60,8 +60,10 @@ mise install            # rust toolchain per mise.toml
 cargo install --path .  # installs the `soundboard` binary to ~/.cargo/bin
 ```
 
-**PATH note:** KDE hotkey files run `Exec=soundboard play ...` with the
-bare command, so `~/.cargo/bin` must be on your `PATH` for hotkeys to work.
+**PATH note:** hotkey files embed the absolute path of the binary that
+registered them (`current_exe()`), so they work regardless of `PATH`. If you
+move or reinstall the binary elsewhere, re-run `soundboard hotkeys --write`
+(or the GUI button) to update the paths.
 
 ## Quick start
 
