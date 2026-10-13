@@ -411,6 +411,16 @@ pub(crate) fn build(
         .default_height(640)
         .build();
 
+    // Window/taskbar icon: the hicolor icon installed by `just
+    // install-desktop`. When it is not installed, keep the theme default —
+    // a missing icon name would render as a broken image glyph.
+    let has_app_icon = gtk4::gdk::Display::default()
+        .map(|display| gtk4::IconTheme::for_display(&display).has_icon(super::APP_ICON))
+        .unwrap_or(false);
+    if has_app_icon {
+        window.set_icon_name(Some(super::APP_ICON));
+    }
+
     let header = adw::HeaderBar::new();
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Soundboard
+GenericName=Виртуальный микрофон со звуковыми клипами
+Comment=Виртуальный микрофон для звонков: клипы, громкость, хоткеи
+Exec=soundboard
+Icon=org.soundboard.App
+StartupWMClass=org.soundboard.App
+Terminal=false
+Categories=AudioVideo;Audio;

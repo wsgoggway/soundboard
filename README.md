@@ -112,10 +112,18 @@ flowchart LR
 mise install            # rust-тулчейн по mise.toml
 cargo install --path .  # бинарник soundboard в ~/.cargo/bin
 just clips-install      # скопировать звуки из репозитория (14 клипов, без перезаписи)
+just install-desktop    # ярлык приложения и иконку в ~/.local (hicolor)
 ```
 
 `just clips-install` кладёт встроенные клипы из каталога `clips/` в
 `~/Music/soundboard-clips` (файлы, которые уже существуют, не трогаются).
+
+`just install-desktop` устанавливает ярлык
+`~/.local/share/applications/org.soundboard.App.desktop` и иконку
+(`org.soundboard.App.svg|png` в hicolor), обновляет кэши (`kbuildsycoca6`,
+`gtk-update-icon-cache`): после этого в меню приложений появляется
+«Soundboard» с фирменной иконкой, а окно и задачи в панели группируются
+правильно (StartupWMClass). Повторный запуск просто обновляет файлы.
 
 **Бинарник в PATH.** `cargo install` кладёт его в `~/.cargo/bin` — убедитесь,
 что каталог в `PATH` (при желании сделайте симлинк:

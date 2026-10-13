@@ -26,6 +26,11 @@ use libadwaita as adw;
 
 use worker::{SharedConfig, Worker};
 
+/// Freedesktop icon name of the app (installed by `just install-desktop`
+/// into hicolor as `org.soundboard.App.svg|png`; the GTK app id and the
+/// desktop-file `StartupWMClass` use the same name).
+pub(crate) const APP_ICON: &str = "org.soundboard.App";
+
 /// Runs the GUI until the tray «Выход» (or a signal) performs the graceful
 /// shutdown and the last window is destroyed. Closing the window only
 /// hides it to the tray while the app keeps running.

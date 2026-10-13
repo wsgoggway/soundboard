@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Soundboard app icon: a neutral speaker glyph with two sound waves on a
+  rounded slate tile. Vector source of truth; a 256x256 PNG is rendered
+  from it (rsvg-convert -w 256 -h 256) and both are installed into hicolor
+  by `just install-desktop`.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="52" fill="#2d3a4f"/>
+  <!-- Speaker: box + cone -->
+  <path d="M56 102 h42 l42 -36 v124 l-42 -36 H56 z"
+        fill="#ffffff" stroke="#ffffff" stroke-width="12"
+        stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- Sound waves -->
+  <g fill="none" stroke="#8fd0ff" stroke-width="14" stroke-linecap="round">
+    <path d="M166 106 a30 30 0 0 1 0 44"/>
+    <path d="M190 84 a58 58 0 0 1 0 88"/>
+  </g>
+</svg>

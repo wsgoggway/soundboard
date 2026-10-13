@@ -132,16 +132,23 @@ fn graph_status_line(graph_ok: bool) -> String {
     }
 }
 
-/// First tray icon present in the current theme, else the primary name as
-/// the sane fallback (the theme renders a generic audio glyph for missing
-/// names, so the item never ends up blank).
+/// First tray icon present in the current theme, else the primary fallback.
+/// The app icon (`just install-desktop` puts it into hicolor) wins when
+/// installed; otherwise the best available theme audio icon is used, and
+/// `audio-input-microphone` is the sane last resort (the theme renders a
+/// generic audio glyph for missing names, so the item never ends up blank).
 #[must_use]
 pub(crate) fn pick_icon_name(theme: &IconTheme) -> String {
-    const CANDIDATES: [&str; 3] = ["audio-input-microphone", "audio-card", "audio-x-generic"];
+    const CANDIDATES: [&str; 4] = [
+        super::APP_ICON,
+        "audio-input-microphone",
+        "audio-card",
+        "audio-x-generic",
+    ];
     CANDIDATES
         .iter()
         .find(|name| theme.has_icon(name))
-        .map_or_else(|| CANDIDATES[0].to_string(), |name| (*name).to_string())
+        .map_or_else(|| CANDIDATES[1].to_string(), |name| (*name).to_string())
 }
 
 /// Spawns the tray service on its own thread and returns the handle for
