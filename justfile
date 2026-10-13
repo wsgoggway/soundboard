@@ -16,8 +16,8 @@ run:
 
 # Copy bundled meme clips into the user's clips directory (no-clobber)
 clips-install:
-    mkdir -p ~/Music/soundboard-clips
-    cp -n clips/* ~/Music/soundboard-clips/
+    mkdir -p ~/.local/share/soundboard-clips
+    cp -n clips/* ~/.local/share/soundboard-clips/
 
 # Install the desktop entry + app icon into ~/.local (hicolor), refresh caches
 install-desktop:
@@ -31,7 +31,7 @@ install-desktop:
     gtk-update-icon-cache -f ~/.local/share/icons/hicolor 2>/dev/null || true
 
 # Decode-audit clips via pw-cat (PLAYS each clip ~2s — audible!)
-clips-check DIR="$HOME/Music/soundboard-clips":
+clips-check DIR="$HOME/.local/share/soundboard-clips":
     #!/bin/sh
     printf '%-5s %s\n' VERDICT CLIP
     for f in "$DIR"/*; do

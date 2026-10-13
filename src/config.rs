@@ -11,7 +11,8 @@
 //!   a stale hand-edited value must not make the whole app refuse to start;
 //!   the clamped value is what gets re-saved on the next `Config::save`).
 //! - `clips_dir` supports a leading `~` (expanded against the user's home
-//!   directory); the default is `~/Music/soundboard-clips`.
+//!   directory); the default is `$XDG_DATA_HOME/soundboard-clips`
+//!   (falling back to `~/.local/share/soundboard-clips`).
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +46,9 @@ pub struct Config {
 }
 
 fn default_clips_dir() -> PathBuf {
-    expand_tilde(Path::new("~/Music/soundboard-clips"))
+    dirs::data_dir()
+        .unwrap_or_else(|| expand_tilde(Path::new("~/.local/share")))
+        .join("soundboard-clips")
 }
 
 fn default_volume() -> f32 {
@@ -163,10 +166,10 @@ mod tests {
     #[test]
     fn defaults_are_documented_values() {
         let cfg = Config::default();
-        assert_eq!(
-            cfg.clips_dir,
-            expand_tilde(Path::new("~/Music/soundboard-clips"))
-        );
+        let expected = dirs::data_dir()
+            .unwrap_or_else(|| expand_tilde(Path::new("~/.local/share")))
+            .join("soundboard-clips");
+        assert_eq!(cfg.clips_dir, expected);
         assert_eq!(cfg.volume, 0.9);
         assert!(cfg.interrupt_mode);
         assert!(cfg.mic_mix);

@@ -35,7 +35,7 @@ Jitsi, Discord и т.д.
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 flowchart LR
-    CLIPS["Клипы<br/>~/Music/soundboard-clips"]
+    CLIPS["Клипы<br/>~/.local/share/soundboard-clips"]
     SB["синк soundboard<br/>Meme_Soundboard (pulse)"]
     MIC["реальный микрофон<br/>определённый источник (не virtmic)"]
     SBM["синк sbmicmix<br/>SB_MicMix (pulse)"]
@@ -116,7 +116,7 @@ just install-desktop    # ярлык приложения и иконку в ~/.
 ```
 
 `just clips-install` кладёт встроенные клипы из каталога `clips/` в
-`~/Music/soundboard-clips` (файлы, которые уже существуют, не трогаются).
+`~/.local/share/soundboard-clips` (файлы, которые уже существуют, не трогаются).
 
 `just install-desktop` устанавливает ярлык
 `~/.local/share/applications/org.soundboard.App.desktop` и иконку
@@ -135,7 +135,7 @@ GUI).
 
 ## Быстрый старт
 
-1. Положите клипы в `~/Music/soundboard-clips` (например,
+1. Положите клипы в `~/.local/share/soundboard-clips` (например,
    `just clips-install`). Форматы: `wav`, `mp3`, `ogg`, `oga`, `flac`,
    `opus`, `m4a`; имя клипа = имя файла без расширения. Подпапки (на один
    уровень) становятся категориями в интерфейсе; поиск — строка «Поиск…».
@@ -180,7 +180,7 @@ GUI).
 предупреждением). Пример структуры:
 
 ```text
-~/Music/soundboard-clips/
+~/.local/share/soundboard-clips/
 ├── airhorn.wav            → категория «Без категории»
 ├── приветствия/
 │   ├── доброе утро.ogg    → категория «приветствия»
@@ -267,7 +267,7 @@ soundboard down               # полностью убрать граф
 
 | Поле | Тип | По умолчанию | Что делает |
 |---|---|---|---|
-| `clips_dir` | путь | `~/Music/soundboard-clips` | Каталог клипов (рекурсивно на один уровень: подпапка = категория; скрытые файлы и подпапки игнорируются; имена-дубликаты — предупреждение, остаётся первый по алфавиту полного пути). |
+| `clips_dir` | путь | `~/.local/share/soundboard-clips` | Каталог клипов (рекурсивно на один уровень: подпапка = категория; скрытые файлы и подпапки игнорируются; имена-дубликаты — предупреждение, остаётся первый по алфавиту полного пути). |
 | `volume` | число `0.0..=1.0` | `0.9` | Громкость воспроизведения (передаётся в `pw-cat --volume`). |
 | `interrupt_mode` | bool | `true` | Повторное нажатие того же клипа перезапускает его; `false` — играет копию поверх. |
 | `mic_mix` | bool | `true` | Пропускать реальный микрофон в виртуальный (через микшерный синк `sbmicmix`). |
@@ -411,7 +411,7 @@ just build           # cargo build
 just test            # cargo test
 just lint            # cargo fmt --check + clippy -D warnings
 just run             # cargo run (GUI)
-just clips-install   # клипы из репозитория в ~/Music/soundboard-clips
+just clips-install   # клипы из репозитория в ~/.local/share/soundboard-clips
 ```
 
 - Тулчейн — только через mise (`mise.toml` закрепляет `stable`); системные

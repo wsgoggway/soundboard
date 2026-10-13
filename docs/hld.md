@@ -41,7 +41,7 @@ pulse-источник `virtmic` — реальный источник, НЕ м�
 ```mermaid
 %%{init: {'flowchart': {'curve': 'linear'}}}%%
 flowchart LR
-    CLIPS["Клипы<br/>~/Music/soundboard-clips"]
+    CLIPS["Клипы<br/>~/.local/share/soundboard-clips"]
     SB["синк soundboard<br/>Meme_Soundboard (pulse)"]
     MIC["реальный микрофон<br/>определённый источник (не virtmic)"]
     SBM["синк sbmicmix<br/>SB_MicMix (pulse)"]
@@ -88,7 +88,7 @@ flowchart LR
     APP -->|"загрузка и выгрузка"| PW["сессия PipeWire<br/>через pipewire-pulse"]
 ```
 
-- `config.toml`: `clips_dir` (`~/Music/soundboard-clips`), `volume`
+- `config.toml`: `clips_dir` (`~/.local/share/soundboard-clips`), `volume`
   (0.9, обрезается в 0.0..=1.0), `interrupt_mode` (true), `mic_mix` (true),
   `monitoring` (false). Нет файла → дефолты; битый → ошибка.
 - `modules.json`: схема v2 — индексы pulse-модулей + ожидаемые имена и
