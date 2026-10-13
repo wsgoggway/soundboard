@@ -3,6 +3,12 @@
 //! failure banner, the virtual mic VU meter, the clip grid and the
 //! playback controls (volume, stop-all, behavior toggles, doctor checks).
 //!
+//! The «Саундборд» page shows one tab (a secondary `gtk::Stack` +
+//! `StackSwitcher`) per clip category; captions, ordering and visibility
+//! come from the optional `.meta.json` files (`crate::meta`). An empty
+//! search keeps the tab view; a non-empty query hides the tab chrome and
+//! shows one flat «Результаты» flow across all categories instead.
+//!
 //! Threading rule (see [`super::worker`]): nothing blocking happens here —
 //! the window only sends [`WorkerCmd`]s to the audio worker and renders
 //! [`GuiMsg`]s arriving over glib channels. The clip grid scans `clips_dir`
@@ -40,6 +46,7 @@ use crate::clips::Clips;
 use crate::config::Config;
 use crate::graph::{CONF_HINT, DoctorReport, Report};
 use crate::hotkeys::{self, Registration};
+use crate::meta;
 
 /// `gtk::Stack` page names (also used for programmatic switches).
 const PAGE_BOARD: &str = "board";
@@ -104,11 +111,20 @@ pub(crate) fn clips_placeholder_text(dir: &Path) -> String {
 }
 
 /// True when a clip matches the live search `query`: case-insensitive
-/// substring on the clip name OR the category name; an empty (or blank)
-/// query matches everything.
-pub(crate) fn clip_matches_query(name: &str, category: &str, query: &str) -> bool {
+/// substring on the clip name, the category directory name OR the category
+/// tab title (from `.meta.json`); an empty (or blank) query matches
+/// everything.
+pub(crate) fn clip_matches_query(
+    name: &str,
+    category_dir: &str,
+    category_title: &str,
+    query: &str,
+) -> bool {
     let q = query.trim().to_lowercase();
-    q.is_empty() || name.to_lowercase().contains(&q) || category.to_lowercase().contains(&q)
+    q.is_empty()
+        || name.to_lowercase().contains(&q)
+        || category_dir.to_lowercase().contains(&q)
+        || category_title.to_lowercase().contains(&q)
 }
 
 /// True when `name` is in the playing set (drives the button highlight).
@@ -288,32 +304,61 @@ fn heading(text: &str) -> Label {
     label
 }
 
-/// One visible category block: a bold header label plus its own `FlowBox`
-/// of clip buttons. `items` keeps (name, button) pairs in insertion order
-/// so the live search filter can walk the section without a widget search.
+/// One category tab: the category's own `FlowBox` of clip buttons. `items`
+/// keeps (name, button) pairs in insertion order so the live search filter
+/// can walk the section without a widget search. `category` (directory
+/// name) is the tab's stable identity — the `gtk::Stack` child name; the
+/// displayed caption is `title` (`.meta.json` title or the directory name).
 struct CategorySection {
     category: String,
-    header: Label,
+    title: String,
     flow: FlowBox,
     items: Vec<(String, Button)>,
 }
 
-/// The clip grid section: a search field plus one [`CategorySection`] per
-/// category (bold header + `FlowBox` of clip buttons), the empty-dir
-/// placeholder, the «no match» line and scan warnings. `buttons` is shared
-/// with the worker message loop so [`GuiMsg::PlayingSet`] can toggle the
+/// The clip grid section: a search field, then a `StackSwitcher` + tab
+/// `gtk::Stack` with one page per category (empty query), or a single flat
+/// «Результаты» `FlowBox` across ALL categories (non-empty query; the tab
+/// chrome hides until the query is cleared). Tabs come from
+/// [`meta::category_tabs`] (`.meta.json` title/order/visible); only tabs
+/// with clips appear. The shown tab survives «Обновить» rescans (matched by
+/// directory name, falling back to the first tab). `buttons` is shared with
+/// the worker message loop so [`GuiMsg::PlayingSet`] can toggle the
 /// highlight. The search filters live (on the UI thread — a substring check
-/// over at most a hundred buttons per keystroke is cheap); the current query
-/// survives «Обновить» rescans.
+/// over at most a hundred buttons per keystroke is cheap).
+/// `meta_warnings_label` (the «Дебаг» page line for `.meta.json` problems)
+/// is filled on every reload.
 struct ClipGrid {
     search: gtk4::SearchEntry,
-    sections_box: GtkBox,
+    switcher: StackSwitcher,
+    tab_stack: Stack,
+    results_heading: Label,
+    results_flow: FlowBox,
     placeholder: Label,
     no_match: Label,
     warnings_label: Label,
     sections: RefCell<Vec<CategorySection>>,
     buttons: Rc<RefCell<HashMap<String, Button>>>,
     query: RefCell<String>,
+    /// Directory name of the tab the user is on (kept across rescans).
+    current_tab: RefCell<Option<String>>,
+    /// Buttons currently moved into the flat results flow, with their home
+    /// section index, so clearing the query can put everything back.
+    results_items: RefCell<Vec<(usize, Button)>>,
+    meta_warnings_label: RefCell<Option<Label>>,
+}
+
+/// Shared `FlowBox` look for category pages and the flat results flow.
+fn clip_flow() -> FlowBox {
+    let flow = FlowBox::new();
+    flow.set_selection_mode(gtk4::SelectionMode::None);
+    flow.set_column_spacing(6);
+    flow.set_row_spacing(6);
+    flow.set_min_children_per_line(2);
+    flow.set_max_children_per_line(6);
+    flow.set_homogeneous(true);
+    flow.set_hexpand(true);
+    flow
 }
 
 impl ClipGrid {
@@ -321,8 +366,17 @@ impl ClipGrid {
         let search = gtk4::SearchEntry::new();
         search.set_placeholder_text(Some("Поиск…"));
         search.set_hexpand(true);
-        let sections_box = GtkBox::new(Orientation::Vertical, 12);
-        sections_box.set_visible(false);
+        let tab_stack = Stack::new();
+        // Pages have different heights (one to a few rows of buttons) — do
+        // not stretch them to the tallest.
+        tab_stack.set_vhomogeneous(false);
+        let switcher = StackSwitcher::new();
+        switcher.set_stack(Some(&tab_stack));
+        switcher.set_halign(gtk4::Align::Center);
+        let results_heading = heading("Результаты");
+        results_heading.set_visible(false);
+        let results_flow = clip_flow();
+        results_flow.set_visible(false);
         let placeholder = Label::builder()
             .label("Клипы: сканирование…")
             .halign(gtk4::Align::Start)
@@ -346,73 +400,133 @@ impl ClipGrid {
         warnings_label.add_css_class("dim-label");
         ClipGrid {
             search,
-            sections_box,
+            switcher,
+            tab_stack,
+            results_heading,
+            results_flow,
             placeholder,
             no_match,
             warnings_label,
             sections: RefCell::new(Vec::new()),
             buttons: Rc::new(RefCell::new(HashMap::new())),
             query: RefCell::new(String::new()),
+            current_tab: RefCell::new(None),
+            results_items: RefCell::new(Vec::new()),
+            meta_warnings_label: RefCell::new(None),
         }
     }
 
-    /// Widget holding the whole section (search, grid, placeholders,
-    /// warnings).
+    /// Widget holding the whole section (search, tabs / results,
+    /// placeholders, warnings).
     fn container(&self) -> GtkBox {
         let box_ = GtkBox::new(Orientation::Vertical, 6);
         box_.append(&self.search);
-        box_.append(&self.sections_box);
+        box_.append(&self.switcher);
+        box_.append(&self.tab_stack);
+        box_.append(&self.results_heading);
+        box_.append(&self.results_flow);
         box_.append(&self.placeholder);
         box_.append(&self.no_match);
         box_.append(&self.warnings_label);
         box_
     }
 
-    /// Applies the current search query to the rendered sections: buttons
-    /// outside the filter hide, empty categories hide entirely, and a
-    /// «ничего не найдено» line appears when nothing matches a non-empty
-    /// query.
-    fn apply_filter(&self) {
-        let query = self.query.borrow().clone();
-        let mut any_visible = false;
-        for section in self.sections.borrow().iter() {
-            let mut visible_count = 0usize;
-            for (name, btn) in &section.items {
-                let visible = clip_matches_query(name, &section.category, &query);
-                btn.set_visible(visible);
-                if visible {
-                    visible_count += 1;
-                }
-            }
-            let section_visible = visible_count > 0;
-            section.header.set_visible(section_visible);
-            section.flow.set_visible(section_visible);
-            any_visible |= section_visible;
-        }
-        self.no_match
-            .set_visible(!query.trim().is_empty() && !any_visible);
+    /// Wires the «Дебаг»-page label that surfaces `.meta.json` problems
+    /// found by the latest scan.
+    fn set_meta_warnings_label(&self, label: Label) {
+        *self.meta_warnings_label.borrow_mut() = Some(label);
     }
 
-    /// Rebuilds the grid from a fresh directory scan (see the module docs:
-    /// cheap, UI-thread-safe), grouped by category, then re-applies the
-    /// current search query.
+    /// Moves every button currently placed into the flat results flow back
+    /// into its home category flow (visibility is left to the caller).
+    fn return_results_home(&self) {
+        let sections = self.sections.borrow();
+        for (idx, btn) in self.results_items.borrow_mut().drain(..) {
+            self.results_flow.remove(&btn);
+            if let Some(section) = sections.get(idx) {
+                section.flow.append(&btn);
+            }
+        }
+    }
+
+    /// Applies the current search query: an empty (or blank) query shows the
+    /// tab view with every button visible; a non-empty query hides the tab
+    /// chrome and moves the matching buttons (clip name, category directory
+    /// or tab title match) into the single flat results flow, showing a
+    /// «ничего не найдено» line when nothing matches.
+    fn apply_filter(&self) {
+        let query = self.query.borrow().clone();
+        if query.trim().is_empty() {
+            self.return_results_home();
+            for section in self.sections.borrow().iter() {
+                for (_name, btn) in &section.items {
+                    btn.set_visible(true);
+                }
+            }
+            let has_tabs = !self.sections.borrow().is_empty();
+            self.switcher.set_visible(has_tabs);
+            self.tab_stack.set_visible(has_tabs);
+            self.results_heading.set_visible(false);
+            self.results_flow.set_visible(false);
+            self.no_match.set_visible(false);
+            return;
+        }
+        self.return_results_home();
+        let sections = self.sections.borrow();
+        let mut any = false;
+        for (idx, section) in sections.iter().enumerate() {
+            for (name, btn) in &section.items {
+                let visible = clip_matches_query(name, &section.category, &section.title, &query);
+                if visible {
+                    section.flow.remove(btn);
+                    self.results_flow.append(btn);
+                    btn.set_visible(true);
+                    self.results_items.borrow_mut().push((idx, btn.clone()));
+                    any = true;
+                } else {
+                    btn.set_visible(false);
+                }
+            }
+        }
+        drop(sections);
+        self.switcher.set_visible(false);
+        self.tab_stack.set_visible(false);
+        self.results_heading.set_visible(true);
+        self.results_flow.set_visible(true);
+        self.no_match.set_visible(!any);
+    }
+
+    /// Rebuilds the tabs from a fresh directory scan (see the module docs:
+    /// cheap, UI-thread-safe), then re-applies the current search query.
+    /// The shown tab is preserved by directory name (first tab as fallback).
     fn reload(&self, cfg: &Config, worker: &Worker) {
         let clips = Clips::scan(&cfg.clips_dir);
-        while let Some(child) = self.sections_box.first_child() {
-            self.sections_box.remove(&child);
+        let (tabs, meta_warnings) = meta::category_tabs(&cfg.clips_dir);
+        // Remember the shown tab BEFORE the pages go away.
+        let previous_tab = self
+            .tab_stack
+            .visible_child_name()
+            .map(|name| name.to_string())
+            .or_else(|| self.current_tab.borrow().clone());
+        while let Some(child) = self.tab_stack.first_child() {
+            self.tab_stack.remove(&child);
         }
         self.sections.borrow_mut().clear();
         self.buttons.borrow_mut().clear();
-        for group in clips.entries().chunk_by(|a, b| a.category == b.category) {
-            let category = group[0].category;
-            let flow = FlowBox::new();
-            flow.set_selection_mode(gtk4::SelectionMode::None);
-            flow.set_column_spacing(6);
-            flow.set_row_spacing(6);
-            flow.set_min_children_per_line(2);
-            flow.set_max_children_per_line(6);
-            flow.set_homogeneous(true);
-            flow.set_hexpand(true);
+        self.results_items.borrow_mut().clear();
+        while let Some(child) = self.results_flow.first_child() {
+            self.results_flow.remove(&child);
+        }
+        let entries = clips.entries();
+        for tab in tabs.iter().filter(|tab| tab.visible) {
+            let group: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.category == tab.dir_name)
+                .collect();
+            if group.is_empty() {
+                continue; // empty categories never get a tab (as before)
+            }
+            let flow = clip_flow();
             let mut items = Vec::new();
             for entry in group {
                 let name = entry.name;
@@ -445,20 +559,18 @@ impl ClipGrid {
                     .insert(name.to_string(), btn.clone());
                 items.push((name.to_string(), btn));
             }
-            let section_box = GtkBox::new(Orientation::Vertical, 6);
-            let header = heading(category);
-            section_box.append(&header);
-            section_box.append(&flow);
-            self.sections_box.append(&section_box);
+            // The stack child name is the directory name (unique — titles
+            // may collide); the visible caption is the meta title.
+            self.tab_stack
+                .add_titled(&flow, Some(&tab.dir_name), &tab.title);
             self.sections.borrow_mut().push(CategorySection {
-                category: category.to_string(),
-                header,
+                category: tab.dir_name.clone(),
+                title: tab.title.clone(),
                 flow,
                 items,
             });
         }
         let empty = clips.is_empty();
-        self.sections_box.set_visible(!empty);
         self.placeholder.set_visible(empty);
         if empty {
             self.placeholder
@@ -468,6 +580,24 @@ impl ClipGrid {
         self.warnings_label.set_visible(!warnings.is_empty());
         if !warnings.is_empty() {
             self.warnings_label.set_text(&warnings.join("\n"));
+        }
+        if let Some(label) = self.meta_warnings_label.borrow().as_ref() {
+            label.set_visible(!meta_warnings.is_empty());
+            if !meta_warnings.is_empty() {
+                label.set_text(&meta_warnings.join("\n"));
+            }
+        }
+        {
+            let sections = self.sections.borrow();
+            let restore = previous_tab
+                .as_deref()
+                .filter(|dir| sections.iter().any(|s| &s.category == dir))
+                .map(str::to_string)
+                .or_else(|| sections.first().map(|s| s.category.clone()));
+            if let Some(dir) = restore {
+                self.tab_stack.set_visible_child_name(&dir);
+                *self.current_tab.borrow_mut() = Some(dir);
+            }
         }
         self.apply_filter();
     }
@@ -560,6 +690,15 @@ pub(crate) fn build(
         .build();
     raw_warnings.add_css_class("dim-label");
 
+    // Tab meta problems (`.meta.json` per category): filled by the clip
+    // grid scan, shown as dim lines on the «Дебаг» page only.
+    let meta_warnings = Label::builder()
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    meta_warnings.add_css_class("dim-label");
+
     // Action buttons of the «Дебаг» page.
     let debug_buttons = GtkBox::new(Orientation::Horizontal, 8);
     let btn_doctor = Button::with_label("Проверить");
@@ -589,6 +728,18 @@ pub(crate) fn build(
 
     // Clips section («Саундборд»): caption + refresh + stop-all + grid.
     let grid = Rc::new(ClipGrid::new());
+    grid.set_meta_warnings_label(meta_warnings.clone());
+    // Track the tab the user switched to, so «Обновить» rescans can restore
+    // it (matched by the stable directory name).
+    {
+        let grid = grid.clone();
+        let tab_stack = grid.tab_stack.clone();
+        tab_stack.connect_notify_local(Some("visible-child-name"), move |stack, _pspec| {
+            if let Some(name) = stack.visible_child_name() {
+                *grid.current_tab.borrow_mut() = Some(name.to_string());
+            }
+        });
+    }
     {
         let grid = grid.clone();
         let search = grid.search.clone();
@@ -673,6 +824,7 @@ pub(crate) fn build(
     debug.append(&debug_buttons);
     debug.append(&checks_frame);
     debug.append(&raw_warnings);
+    debug.append(&meta_warnings);
 
     // The stack itself; the switcher lives in the header bar title area.
     let stack = Stack::new();
@@ -1274,16 +1426,34 @@ mod tests {
     #[test]
     fn search_filter_matches_name_or_category_case_insensitively() {
         // Empty (or blank) query matches everything.
-        assert!(clip_matches_query("airhorn", "Без категории", ""));
-        assert!(clip_matches_query("airhorn", "Без категории", "   "));
+        assert!(clip_matches_query("airhorn", "Без категории", "Общий", ""));
+        assert!(clip_matches_query(
+            "airhorn",
+            "Без категории",
+            "Общий",
+            "   "
+        ));
         // Substring on the clip name, case-insensitive.
-        assert!(clip_matches_query("airhorn", "Мемы", "AIR"));
-        assert!(clip_matches_query("Не Молчите", "Кринж", "молч"));
-        // Substring on the category name.
-        assert!(clip_matches_query("airhorn", "Мемы", "мем"));
+        assert!(clip_matches_query("airhorn", "Мемы", "Мемы", "AIR"));
+        assert!(clip_matches_query("Не Молчите", "Кринж", "Кринж", "молч"));
+        // Substring on the category directory name.
+        assert!(clip_matches_query("airhorn", "Мемы", "Мемы", "мем"));
+        // Substring on the meta tab title (differs from the directory name).
+        assert!(clip_matches_query(
+            "airhorn",
+            "hello_dir",
+            "Приветствия",
+            "привет"
+        ));
+        assert!(clip_matches_query(
+            "airhorn",
+            "hello_dir",
+            "Приветствия",
+            "hello_dir"
+        ));
         // Misses stay hidden.
-        assert!(!clip_matches_query("airhorn", "Мемы", "bruh"));
-        assert!(!clip_matches_query("airhorn", "Мемы", "xyz"));
+        assert!(!clip_matches_query("airhorn", "Мемы", "Мемы", "bruh"));
+        assert!(!clip_matches_query("airhorn", "Мемы", "Мемы", "xyz"));
     }
 
     #[test]

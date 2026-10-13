@@ -17,6 +17,7 @@ mod clips;
 mod config;
 mod graph;
 mod hotkeys;
+mod meta;
 mod meter;
 mod player;
 mod scheduler;

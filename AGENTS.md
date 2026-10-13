@@ -60,7 +60,8 @@ Jitsi, Discord, …).
   its own thread, menu actions only send `tray::TrayCmd`s to the main
   loop); closing the window hides to the tray (app keeps running), quit
   via tray «Выход»/signals through the same graceful path; second launch
-  presents the existing window (gio single-instance); «Саундборд» = grid + stop-all + volume +
+  presents the existing window (gio single-instance); «Саундборд» = category tabs + search (empty
+  query = tabs, non-empty = flat results across categories) + stop-all + volume +
   VU meter + CONF_HINT, «Настройки» = toggles + «Глобальные хоткеи»
   management + clips-dir row (xdg-open), «Дебаг» = doctor checks with their
   detail lines inline + repair buttons; a window-level `AdwBanner` shows
@@ -94,10 +95,14 @@ Toolchains come via mise only; never install system packages.
   `~/.cache/soundboard/transcoded`, keyed by source mtime+size)
 - `src/clips.rs` — clips directory registry (one-level recursive scan:
   subdirectory = category)
+- `src/meta.rs` — category tab metadata: optional `.meta.json` per
+  category directory (title/order/visible, lenient parsing, warnings on
+  malformed files); GUI-only cosmetics, CLI/hotkeys keep directory names
 - `src/scheduler.rs` — per-clip interrupt decisions
 - `src/meter.rs` — audio level metering (M3)
-- `src/ui/` — GTK4/libadwaita UI (M3; clip grid grouped by category with a
-  live search field)
+- `src/ui/` — GTK4/libadwaita UI (M3; clip categories as tabs of a
+  secondary `gtk::Stack` + `StackSwitcher` on the «Саундборд» page, live
+  search flattens into one results flow across categories)
 - `assets/icons/` — app icon (`org.soundboard.App.svg` + 256px png);
   `assets/org.soundboard.App.desktop` — launcher installed by
   `just install-desktop`
