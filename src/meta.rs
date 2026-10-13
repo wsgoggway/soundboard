@@ -18,7 +18,8 @@
 //!   warning string (surfaced on the «Дебаг» page by the GUI);
 //! - `title` — the tab caption; default is the directory name (the root
 //!   category defaults to [`ROOT_TITLE`]);
-//! - `order` — sort key; default 0; tabs sort by (order, directory name);
+//! - `order` — sort key; default 0; non-root tabs sort by (order, directory
+//!   name); the root tab is ALWAYS first regardless of its `order`;
 //! - `visible` — default true; false hides the tab entirely (its clips are
 //!   also excluded from the GUI search: hidden means hidden).
 //!
@@ -112,12 +113,12 @@ pub struct CategoryTab {
 /// Builds the GUI tab list for `clips_dir`: the root category first-class
 /// (meta from `clips_dir/.meta.json`, default title [`ROOT_TITLE`]) plus one
 /// entry per non-hidden one-level subdirectory (meta from
-/// `<subdir>/.meta.json`, default title = directory name). Sorted by
-/// (order, directory name). Meta problems become warning strings; the
-/// affected tab falls back to defaults.
+/// `<subdir>/.meta.json`, default title = directory name). The ROOT tab is
+/// always FIRST (the default landing tab — its meta `order` does not affect
+/// positioning); the rest sort by (order, directory name). Meta problems
+/// become warning strings; the affected tab falls back to defaults.
 pub fn category_tabs(clips_dir: &Path) -> (Vec<CategoryTab>, Vec<String>) {
     let mut warnings: Vec<String> = Vec::new();
-    let mut tabs: Vec<CategoryTab> = Vec::new();
 
     let root_meta = match CategoryMeta::load(clips_dir) {
         Ok(meta) => meta,
@@ -126,12 +127,12 @@ pub fn category_tabs(clips_dir: &Path) -> (Vec<CategoryTab>, Vec<String>) {
             CategoryMeta::default()
         }
     };
-    tabs.push(CategoryTab {
+    let root_tab = CategoryTab {
         dir_name: UNCATEGORIZED.to_string(),
         title: root_meta.effective_title(ROOT_TITLE).to_string(),
         order: root_meta.effective_order(),
         visible: root_meta.effective_visible(),
-    });
+    };
 
     // The subdirectory set mirrors Clips::scan: non-hidden directories one
     // level deep, sorted by name for a deterministic input order.
@@ -150,6 +151,7 @@ pub fn category_tabs(clips_dir: &Path) -> (Vec<CategoryTab>, Vec<String>) {
         }
     }
     subdirs.sort();
+    let mut rest: Vec<CategoryTab> = Vec::new();
     for name in subdirs {
         let meta = match CategoryMeta::load(&clips_dir.join(&name)) {
             Ok(meta) => meta,
@@ -158,18 +160,24 @@ pub fn category_tabs(clips_dir: &Path) -> (Vec<CategoryTab>, Vec<String>) {
                 CategoryMeta::default()
             }
         };
-        tabs.push(CategoryTab {
+        rest.push(CategoryTab {
             title: meta.effective_title(&name).to_string(),
             dir_name: name.clone(),
             order: meta.effective_order(),
             visible: meta.effective_visible(),
         });
     }
-    tabs.sort_by(|a, b| {
+    // The root tab is always first: it is the default landing tab and its
+    // meta `order` does not affect positioning. The rest sort by (order,
+    // directory name).
+    rest.sort_by(|a, b| {
         a.order
             .cmp(&b.order)
             .then_with(|| a.dir_name.cmp(&b.dir_name))
     });
+    let mut tabs = Vec::with_capacity(rest.len() + 1);
+    tabs.push(root_tab);
+    tabs.extend(rest);
     (tabs, warnings)
 }
 
@@ -307,10 +315,9 @@ mod tests {
         let (tabs, warnings) = category_tabs(dir.path());
         assert!(warnings.is_empty());
         let names: Vec<&str> = tabs.iter().map(|t| t.dir_name.as_str()).collect();
-        // order: root 0, Beta 0, Alpha 5 — the 0 tie sorts by directory
-        // name, and "Beta" (ASCII 'B') precedes «Без категории» (Cyrillic
-        // bytes) in byte order.
-        assert_eq!(names, vec!["Beta", UNCATEGORIZED, "Alpha"]);
+        // Root is pinned first; the rest sort by (order, name):
+        // Beta 0, Alpha 5.
+        assert_eq!(names, vec![UNCATEGORIZED, "Beta", "Alpha"]);
         assert_eq!(tab_by_dir(&tabs, UNCATEGORIZED).title, ROOT_TITLE);
         assert_eq!(tab_by_dir(&tabs, "Alpha").title, "Alpha");
     }
@@ -323,9 +330,10 @@ mod tests {
         let (tabs, warnings) = category_tabs(dir.path());
         assert!(warnings.is_empty());
         assert_eq!(tab_by_dir(&tabs, "hello_dir").title, "Приветствия");
-        // Negative order puts the subdir before the root tab.
-        assert_eq!(tabs[0].dir_name, "hello_dir");
-        assert_eq!(tabs[1].dir_name, UNCATEGORIZED);
+        // The root tab stays first even against a negative-order subdir;
+        // the subdir follows as the first non-root tab.
+        assert_eq!(tabs[0].dir_name, UNCATEGORIZED);
+        assert_eq!(tabs[1].dir_name, "hello_dir");
     }
 
     #[test]
@@ -348,17 +356,31 @@ mod tests {
     }
 
     #[test]
-    fn root_meta_sets_title_and_order() {
+    fn root_meta_sets_title_and_stays_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_meta(dir.path(), r#"{"title":"Все подряд","order":100}"#);
         subdir(dir.path(), "Zed");
         let (tabs, _) = category_tabs(dir.path());
         assert_eq!(tab_by_dir(&tabs, UNCATEGORIZED).title, "Все подряд");
         assert_eq!(tab_by_dir(&tabs, UNCATEGORIZED).order, 100);
+        // The root tab is pinned first regardless of its order.
         assert_eq!(
-            tabs.last().map(|t| t.dir_name.as_str()),
+            tabs.first().map(|t| t.dir_name.as_str()),
             Some(UNCATEGORIZED)
         );
+    }
+
+    #[test]
+    fn root_tab_precedes_negative_order_subdirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = subdir(dir.path(), "Aaa");
+        write_meta(&sub, r#"{"order":-5}"#);
+        let (tabs, _) = category_tabs(dir.path());
+        assert_eq!(
+            tabs.first().map(|t| t.dir_name.as_str()),
+            Some(UNCATEGORIZED)
+        );
+        assert_eq!(tabs.get(1).map(|t| t.dir_name.as_str()), Some("Aaa"));
     }
 
     #[test]
