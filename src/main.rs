@@ -111,8 +111,14 @@ fn run() -> Result<ExitCode> {
             if clips.is_empty() {
                 println!("клипы не найдены в {}", cfg.clips_dir.display());
             } else {
-                for name in clips.list() {
-                    println!("{name}");
+                // Parse-friendly one-per-line output: `category/name` for
+                // clips from subdirectories, bare `name` for top-level ones.
+                for entry in clips.entries() {
+                    if entry.category == clips::UNCATEGORIZED {
+                        println!("{}", entry.name);
+                    } else {
+                        println!("{}/{}", entry.category, entry.name);
+                    }
                 }
             }
             Ok(ExitCode::SUCCESS)

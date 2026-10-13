@@ -103,6 +103,14 @@ pub(crate) fn clips_placeholder_text(dir: &Path) -> String {
     )
 }
 
+/// True when a clip matches the live search `query`: case-insensitive
+/// substring on the clip name OR the category name; an empty (or blank)
+/// query matches everything.
+pub(crate) fn clip_matches_query(name: &str, category: &str, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    q.is_empty() || name.to_lowercase().contains(&q) || category.to_lowercase().contains(&q)
+}
+
 /// True when `name` is in the playing set (drives the button highlight).
 pub(crate) fn clip_is_playing(playing: &[String], name: &str) -> bool {
     playing.iter().any(|n| n == name)
@@ -280,32 +288,56 @@ fn heading(text: &str) -> Label {
     label
 }
 
-/// The clip grid section: a `FlowBox` of clip buttons plus the empty-dir
-/// placeholder and scan warnings. `buttons` is shared with the worker
-/// message loop so [`GuiMsg::PlayingSet`] can toggle the highlight.
-struct ClipGrid {
+/// One visible category block: a bold header label plus its own `FlowBox`
+/// of clip buttons. `items` keeps (name, button) pairs in insertion order
+/// so the live search filter can walk the section without a widget search.
+struct CategorySection {
+    category: String,
+    header: Label,
     flow: FlowBox,
+    items: Vec<(String, Button)>,
+}
+
+/// The clip grid section: a search field plus one [`CategorySection`] per
+/// category (bold header + `FlowBox` of clip buttons), the empty-dir
+/// placeholder, the «no match» line and scan warnings. `buttons` is shared
+/// with the worker message loop so [`GuiMsg::PlayingSet`] can toggle the
+/// highlight. The search filters live (on the UI thread — a substring check
+/// over at most a hundred buttons per keystroke is cheap); the current query
+/// survives «Обновить» rescans.
+struct ClipGrid {
+    search: gtk4::SearchEntry,
+    sections_box: GtkBox,
     placeholder: Label,
+    no_match: Label,
     warnings_label: Label,
+    sections: RefCell<Vec<CategorySection>>,
     buttons: Rc<RefCell<HashMap<String, Button>>>,
+    query: RefCell<String>,
 }
 
 impl ClipGrid {
     fn new() -> Self {
-        let flow = FlowBox::new();
-        flow.set_selection_mode(gtk4::SelectionMode::None);
-        flow.set_column_spacing(6);
-        flow.set_row_spacing(6);
-        flow.set_min_children_per_line(2);
-        flow.set_max_children_per_line(6);
-        flow.set_homogeneous(true);
-        flow.set_hexpand(true);
+        let search = gtk4::SearchEntry::new();
+        search.set_placeholder_text(Some("Поиск…"));
+        search.set_hexpand(true);
+        let sections_box = GtkBox::new(Orientation::Vertical, 12);
+        sections_box.set_visible(false);
         let placeholder = Label::builder()
             .label("Клипы: сканирование…")
             .halign(gtk4::Align::Start)
             .wrap(true)
             .sensitive(false)
+            .visible(false)
             .build();
+        let no_match = Label::builder()
+            .label("Ничего не найдено по запросу")
+            .halign(gtk4::Align::Start)
+            .wrap(true)
+            .sensitive(false)
+            .visible(false)
+            .build();
+        no_match.add_css_class("dim-label");
         let warnings_label = Label::builder()
             .halign(gtk4::Align::Start)
             .wrap(true)
@@ -313,56 +345,120 @@ impl ClipGrid {
             .build();
         warnings_label.add_css_class("dim-label");
         ClipGrid {
-            flow,
+            search,
+            sections_box,
             placeholder,
+            no_match,
             warnings_label,
+            sections: RefCell::new(Vec::new()),
             buttons: Rc::new(RefCell::new(HashMap::new())),
+            query: RefCell::new(String::new()),
         }
     }
 
-    /// Widget holding the whole section (grid, placeholder, warnings).
+    /// Widget holding the whole section (search, grid, placeholders,
+    /// warnings).
     fn container(&self) -> GtkBox {
         let box_ = GtkBox::new(Orientation::Vertical, 6);
-        box_.append(&self.flow);
+        box_.append(&self.search);
+        box_.append(&self.sections_box);
         box_.append(&self.placeholder);
+        box_.append(&self.no_match);
         box_.append(&self.warnings_label);
         box_
     }
 
+    /// Applies the current search query to the rendered sections: buttons
+    /// outside the filter hide, empty categories hide entirely, and a
+    /// «ничего не найдено» line appears when nothing matches a non-empty
+    /// query.
+    fn apply_filter(&self) {
+        let query = self.query.borrow().clone();
+        let mut any_visible = false;
+        for section in self.sections.borrow().iter() {
+            let mut visible_count = 0usize;
+            for (name, btn) in &section.items {
+                let visible = clip_matches_query(name, &section.category, &query);
+                btn.set_visible(visible);
+                if visible {
+                    visible_count += 1;
+                }
+            }
+            let section_visible = visible_count > 0;
+            section.header.set_visible(section_visible);
+            section.flow.set_visible(section_visible);
+            any_visible |= section_visible;
+        }
+        self.no_match
+            .set_visible(!query.trim().is_empty() && !any_visible);
+    }
+
     /// Rebuilds the grid from a fresh directory scan (see the module docs:
-    /// cheap, UI-thread-safe).
+    /// cheap, UI-thread-safe), grouped by category, then re-applies the
+    /// current search query.
     fn reload(&self, cfg: &Config, worker: &Worker) {
         let clips = Clips::scan(&cfg.clips_dir);
-        while let Some(child) = self.flow.first_child() {
-            self.flow.remove(&child);
+        while let Some(child) = self.sections_box.first_child() {
+            self.sections_box.remove(&child);
         }
+        self.sections.borrow_mut().clear();
         self.buttons.borrow_mut().clear();
-        for name in clips.list() {
-            let Some(path) = clips.get(name) else {
-                continue;
-            };
-            let file_name = path
-                .file_name()
-                .map_or_else(|| name.to_string(), |n| n.to_string_lossy().into_owned());
-            let btn = Button::with_label(name);
-            btn.set_tooltip_text(Some(&file_name));
-            if let Some(inner) = btn.child().and_downcast::<Label>() {
-                inner.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            }
-            {
-                let worker = worker.clone();
-                let clip_name = name.to_string();
-                btn.connect_clicked(move |_| {
-                    worker.send(WorkerCmd::Play {
-                        name: clip_name.clone(),
+        for group in clips.entries().chunk_by(|a, b| a.category == b.category) {
+            let category = group[0].category;
+            let flow = FlowBox::new();
+            flow.set_selection_mode(gtk4::SelectionMode::None);
+            flow.set_column_spacing(6);
+            flow.set_row_spacing(6);
+            flow.set_min_children_per_line(2);
+            flow.set_max_children_per_line(6);
+            flow.set_homogeneous(true);
+            flow.set_hexpand(true);
+            let mut items = Vec::new();
+            for entry in group {
+                let name = entry.name;
+                let file_name = entry
+                    .path
+                    .file_name()
+                    .map_or_else(|| name.to_string(), |n| n.to_string_lossy().into_owned());
+                let btn = Button::with_label(name);
+                let tooltip = if entry.category == crate::clips::UNCATEGORIZED {
+                    file_name
+                } else {
+                    format!("{}/{}", entry.category, file_name)
+                };
+                btn.set_tooltip_text(Some(&tooltip));
+                if let Some(inner) = btn.child().and_downcast::<Label>() {
+                    inner.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                }
+                {
+                    let worker = worker.clone();
+                    let clip_name = name.to_string();
+                    btn.connect_clicked(move |_| {
+                        worker.send(WorkerCmd::Play {
+                            name: clip_name.clone(),
+                        });
                     });
-                });
+                }
+                flow.append(&btn);
+                self.buttons
+                    .borrow_mut()
+                    .insert(name.to_string(), btn.clone());
+                items.push((name.to_string(), btn));
             }
-            self.flow.append(&btn);
-            self.buttons.borrow_mut().insert(name.to_string(), btn);
+            let section_box = GtkBox::new(Orientation::Vertical, 6);
+            let header = heading(category);
+            section_box.append(&header);
+            section_box.append(&flow);
+            self.sections_box.append(&section_box);
+            self.sections.borrow_mut().push(CategorySection {
+                category: category.to_string(),
+                header,
+                flow,
+                items,
+            });
         }
         let empty = clips.is_empty();
-        self.flow.set_visible(!empty);
+        self.sections_box.set_visible(!empty);
         self.placeholder.set_visible(empty);
         if empty {
             self.placeholder
@@ -373,6 +469,7 @@ impl ClipGrid {
         if !warnings.is_empty() {
             self.warnings_label.set_text(&warnings.join("\n"));
         }
+        self.apply_filter();
     }
 
     /// Highlights the buttons of currently playing clips.
@@ -492,6 +589,14 @@ pub(crate) fn build(
 
     // Clips section («Саундборд»): caption + refresh + stop-all + grid.
     let grid = Rc::new(ClipGrid::new());
+    {
+        let grid = grid.clone();
+        let search = grid.search.clone();
+        search.connect_search_changed(move |entry| {
+            *grid.query.borrow_mut() = entry.text().to_string();
+            grid.apply_filter();
+        });
+    }
     let btn_refresh = Button::with_label("Обновить");
     btn_refresh.add_css_class("flat");
     let btn_stop_all = Button::with_label("Стоп всё");
@@ -1164,6 +1269,21 @@ mod tests {
         let text = clips_placeholder_text(Path::new("/home/u/Music/clips"));
         assert!(text.contains("/home/u/Music/clips"), "{text}");
         assert!(text.contains("mp3/ogg/wav/flac"), "{text}");
+    }
+
+    #[test]
+    fn search_filter_matches_name_or_category_case_insensitively() {
+        // Empty (or blank) query matches everything.
+        assert!(clip_matches_query("airhorn", "Без категории", ""));
+        assert!(clip_matches_query("airhorn", "Без категории", "   "));
+        // Substring on the clip name, case-insensitive.
+        assert!(clip_matches_query("airhorn", "Мемы", "AIR"));
+        assert!(clip_matches_query("Не Молчите", "Кринж", "молч"));
+        // Substring on the category name.
+        assert!(clip_matches_query("airhorn", "Мемы", "мем"));
+        // Misses stay hidden.
+        assert!(!clip_matches_query("airhorn", "Мемы", "bruh"));
+        assert!(!clip_matches_query("airhorn", "Мемы", "xyz"));
     }
 
     #[test]
