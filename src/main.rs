@@ -32,7 +32,7 @@ use cli::Commands;
 use clips::Clips;
 use config::Config;
 use graph::{Graph, PulseSession, PwTooling};
-use player::{Player as _, PwCatPlayer};
+use player::{Player as _, PwCatPlayer, Transcoder};
 
 fn main() -> ExitCode {
     match run() {
@@ -130,12 +130,14 @@ fn run() -> Result<ExitCode> {
             let clip = clips.resolve(&name)?;
             ensure_graph(&cfg)?;
             // Per-clip interrupt across CLI invocations: a second play of the
-            // same clip kills the playback started by a previous process.
+            // same clip kills the playback started by a previous process —
+            // under the original path AND its transcoded cache twin (the
+            // decode fallback plays the wav, whose path differs).
             // (The resident GUI in M3 does this via the scheduler instead.)
-            if cfg.interrupt_mode {
-                PwCatPlayer::stop_external(Some(clip.path))?;
-            }
             let mut player = PwCatPlayer::new();
+            if cfg.interrupt_mode {
+                PwCatPlayer::stop_clip_everywhere(clip.path, player.transcoder())?;
+            }
             player.play(clip.path, clip.name, cfg.volume)?;
             println!("воспроизведение: {}", clip.name);
             Ok(ExitCode::SUCCESS)
@@ -230,7 +232,11 @@ fn run() -> Result<ExitCode> {
                     );
                 }
             }
-            let stopped = PwCatPlayer::stop_external(clip_path.as_deref())?;
+            let stopped = match clip_path.as_deref() {
+                // A named stop also hits the transcoded cache twin.
+                Some(path) => PwCatPlayer::stop_clip_everywhere(path, &Transcoder::new())?,
+                None => PwCatPlayer::stop_external(None)?,
+            };
             match (&name, stopped) {
                 (Some(clip_name), 0) => println!("{clip_name} не воспроизводится"),
                 (Some(clip_name), _) => println!("остановлено: {clip_name}"),

@@ -89,11 +89,18 @@ Toolchains come via mise only; never install system packages.
 - `src/hotkeys.rs` — KDE Plasma hotkey table + `.desktop` generation (M4)
 - `src/config.rs` — config load (~/.config/soundboard/config.toml)
 - `src/graph.rs` — PipeWire graph management (pulse null-sink + monitoring loopback; native `Audio/Source/Virtual` node `virtmic` + pw-link feeds) plus module/node-ownership state
-- `src/player.rs` — clip playback (pw-cat subprocess in v1)
-- `src/clips.rs` — clips directory registry
+- `src/player.rs` — clip playback (pw-cat subprocess in v1) + ffmpeg
+  transcode fallback for clips pw-cat cannot decode (`Transcoder`, cache in
+  `~/.cache/soundboard/transcoded`, keyed by source mtime+size)
+- `src/clips.rs` — clips directory registry (one-level recursive scan:
+  subdirectory = category)
 - `src/scheduler.rs` — per-clip interrupt decisions
 - `src/meter.rs` — audio level metering (M3)
-- `src/ui/` — GTK4/libadwaita UI (M3)
+- `src/ui/` — GTK4/libadwaita UI (M3; clip grid grouped by category with a
+  live search field)
+- `assets/icons/` — app icon (`org.soundboard.App.svg` + 256px png);
+  `assets/org.soundboard.App.desktop` — launcher installed by
+  `just install-desktop`
 - `examples/vu_probe.rs` — CLI peak probe for debugging the meter (M3b)
 
 ## Docs

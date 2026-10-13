@@ -25,6 +25,20 @@
 //!   error with the first stderr line; a still-running child is success, and
 //!   its (healthy, silent) stderr log is deleted right away.
 //!
+//! Transcode fallback ([`Transcoder`]): real-world clips are sometimes
+//! ogg-opus files libsndfile (the `pw-cat` decoder) refuses as malformed —
+//! e.g. files muxed by old ffmpeg whose first audio page granule position is
+//! `48000 - pre-skip`, less than the samples completing on that page (see
+//! `docs/pipewire-recipe.md`). When the FIRST spawn dies within the probe
+//! window and `ffmpeg` is available, the clip is transcoded once to a
+//! canonical 48 kHz stereo wav under `~/.cache/soundboard/transcoded/`
+//! (`<stem>-<mtime+size hash>.wav`, argv array, no shell) and the cached wav
+//! is played instead. The cache key is the source mtime + size, so an
+//! edited clip is re-transcoded; a failed transcode (or a missing ffmpeg)
+//! surfaces the ORIGINAL decode error — never a crash, never a silent
+//! success. The decision logic (cache key, needs-transcode, candidates) is
+//! pure and unit-tested with an injected fake ffmpeg.
+//!
 //! Cross-process stop (CLI): `soundboard play` exits right after spawning, so
 //! a later `soundboard stop` finds the orphaned `pw-cat`s by scanning
 //! `/proc/*/cmdline` for our exact argument shape (`--playback`, `--target
@@ -40,6 +54,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -53,12 +68,18 @@ use crate::scheduler::Handle;
 
 /// Player binary resolved from `PATH`.
 const PW_CAT: &str = "pw-cat";
+/// ffmpeg binary resolved from `PATH` for the transcode fallback.
+const FFMPEG: &str = "ffmpeg";
 /// How long `play` watches for an immediate (decode) failure.
 const PROBE_WINDOW: Duration = Duration::from_millis(300);
 /// Grace period for SIGTERM before escalating to SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll step for process-state checks.
 const POLL_STEP: Duration = Duration::from_millis(10);
+
+/// Outcome of the probe window: `Ok(handle)` while playing, `Err(error)`
+/// when the child died immediately (the decode-failure signal).
+type ProbeOutcome = std::result::Result<Handle, anyhow::Error>;
 
 /// One clip playing in a process we did not spawn in this lifetime
 /// (e.g. spawned by an earlier `soundboard play` invocation).
@@ -94,24 +115,28 @@ struct RunningChild {
     stderr_log: PathBuf,
 }
 
-/// v1 player: spawns `pw-cat` per clip (see module docs).
+/// v1 player: spawns `pw-cat` per clip (see module docs) with an ffmpeg
+/// transcode fallback for clips `pw-cat` cannot decode.
 #[derive(Debug)]
 pub struct PwCatPlayer {
     binary: PathBuf,
     target: String,
     probe_window: Duration,
+    transcoder: Transcoder,
     children: BTreeMap<Handle, RunningChild>,
     next_id: u64,
 }
 
 impl PwCatPlayer {
-    /// Player targeting [`SINK_MEMES`] with `pw-cat` from `PATH`.
+    /// Player targeting [`SINK_MEMES`] with `pw-cat` from `PATH`; the
+    /// transcoder auto-detects `ffmpeg` once here (a PATH scan, no spawn).
     #[must_use]
     pub fn new() -> Self {
         PwCatPlayer {
             binary: PathBuf::from(PW_CAT),
             target: SINK_MEMES.to_string(),
             probe_window: PROBE_WINDOW,
+            transcoder: Transcoder::new(),
             children: BTreeMap::new(),
             next_id: 1,
         }
@@ -131,10 +156,73 @@ impl PwCatPlayer {
         self
     }
 
+    /// Overrides the transcoder (tests inject a fake ffmpeg and a temp
+    /// cache dir; [`Transcoder::disabled`] turns the fallback off).
+    #[must_use]
+    pub fn with_transcoder(mut self, transcoder: Transcoder) -> Self {
+        self.transcoder = transcoder;
+        self
+    }
+
+    /// The player's transcode fallback; the CLI reads it to stop a cached
+    /// twin playback before an interrupting play (see
+    /// [`PwCatPlayer::stop_clip_everywhere`]).
+    #[must_use]
+    pub fn transcoder(&self) -> &Transcoder {
+        &self.transcoder
+    }
+
     fn alloc_handle(&mut self) -> Handle {
         let handle = Handle::from_u64(self.next_id);
         self.next_id += 1;
         handle
+    }
+
+    /// Spawns `pw-cat` for `clip` and probes it. Outer `Err`: the spawn or
+    /// the probe itself failed (binary missing, poll error) — not a decode
+    /// verdict. Inner `Err`: the child exited within the probe window with a
+    /// non-zero status — the decode-failure case the transcode fallback
+    /// reacts to. Inner `Ok`: the clip is playing.
+    fn spawn_with_probe(&mut self, clip: &Path, name: &str, volume: f32) -> Result<ProbeOutcome> {
+        let volume = volume.clamp(0.0, 1.0);
+        let (handle, mut running) = self.spawn(clip, name, volume)?;
+
+        let deadline = Instant::now() + self.probe_window;
+        let mut exited: Option<std::process::ExitStatus> = None;
+        while Instant::now() < deadline {
+            match running.child.try_wait() {
+                Ok(Some(status)) => {
+                    exited = Some(status);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = running.child.kill();
+                    let _ = running.child.wait();
+                    return Err(anyhow::anyhow!("сбой опроса плеера: {e}"));
+                }
+            }
+            thread::sleep(POLL_STEP);
+        }
+        match exited {
+            Some(status) => {
+                let stderr = read_first_line(&running.stderr_log);
+                remove_log_best_effort(&running.stderr_log);
+                let err = anyhow::anyhow!(
+                    "плеер завершился сразу с {status}{}",
+                    stderr.map_or_else(String::new, |line| format!(": {line}"))
+                );
+                Ok(Err(err))
+            }
+            None => {
+                // Healthy: pw-cat is quiet on stderr once playing, so the log
+                // file is deleted now (the child keeps its fd; the path is
+                // never re-created).
+                remove_log_best_effort(&running.stderr_log);
+                self.children.insert(handle, running);
+                Ok(Ok(handle))
+            }
+        }
     }
 
     fn spawn(&mut self, clip: &Path, name: &str, volume: f32) -> Result<(Handle, RunningChild)> {
@@ -189,42 +277,19 @@ impl Default for PwCatPlayer {
 impl Player for PwCatPlayer {
     fn play(&mut self, clip: &Path, name: &str, volume: f32) -> Result<Handle> {
         self.reap();
-        let (handle, mut running) = self.spawn(clip, name, volume)?;
-
-        let deadline = Instant::now() + self.probe_window;
-        let mut exited: Option<std::process::ExitStatus> = None;
-        while Instant::now() < deadline {
-            match running.child.try_wait() {
-                Ok(Some(status)) => {
-                    exited = Some(status);
-                    break;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = running.child.kill();
-                    let _ = running.child.wait();
-                    bail!("сбой опроса плеера: {e}");
-                }
-            }
-            thread::sleep(POLL_STEP);
-        }
-        match exited {
-            Some(status) => {
-                let stderr = read_first_line(&running.stderr_log);
-                remove_log_best_effort(&running.stderr_log);
-                bail!(
-                    "плеер завершился сразу с {status}{}",
-                    stderr.map_or_else(String::new, |line| format!(": {line}"))
-                )
-            }
-            None => {
-                // Healthy: pw-cat is quiet on stderr once playing, so the log
-                // file is deleted now (the child keeps its fd; the path is
-                // never re-created).
-                remove_log_best_effort(&running.stderr_log);
-                self.children.insert(handle, running);
-                Ok(handle)
-            }
+        match self.spawn_with_probe(clip, name, volume)? {
+            Ok(handle) => Ok(handle),
+            // Decode failure: fall back to a transcoded wav when ffmpeg is
+            // available; anything else (transcode failure, no ffmpeg)
+            // surfaces the ORIGINAL decode error.
+            Err(decode_err) => match self.transcoder.transcode(clip) {
+                None => Err(decode_err),
+                Some(Err(_transcode_err)) => Err(decode_err),
+                Some(Ok(cached)) => match self.spawn_with_probe(&cached, name, volume)? {
+                    Ok(handle) => Ok(handle),
+                    Err(cached_err) => Err(cached_err),
+                },
+            },
         }
     }
 
@@ -373,6 +438,200 @@ impl PwCatPlayer {
         }
         Ok(stopped)
     }
+
+    /// Stops every external playback of `clip` — under its original path AND
+    /// its transcoded cache twin ([`playback_candidates`]). The CLI uses
+    /// this for cross-process per-clip interrupt/stop; the GUI interrupts
+    /// through scheduler handles instead, so the cache twin matters only for
+    /// playbacks spawned by `soundboard play`.
+    ///
+    /// # Errors
+    /// Same as [`PwCatPlayer::stop_external`].
+    pub fn stop_clip_everywhere(clip: &Path, transcoder: &Transcoder) -> Result<usize> {
+        let mut stopped = 0usize;
+        for path in playback_candidates(clip, transcoder) {
+            stopped += Self::stop_external(Some(&path))?;
+        }
+        Ok(stopped)
+    }
+}
+
+/// Paths a clip may be playing under right now: the original file plus its
+/// transcoded cache twin when one exists (the fallback plays the wav, whose
+/// `/proc/<pid>/cmdline` path differs from the source path).
+fn playback_candidates(clip: &Path, transcoder: &Transcoder) -> Vec<PathBuf> {
+    let mut candidates = vec![clip.to_path_buf()];
+    if let Some(cached) = transcoder.cache_path(clip)
+        && cached.exists()
+    {
+        candidates.push(cached);
+    }
+    candidates
+}
+
+/// Transcode fallback: decodes a clip `pw-cat` cannot read into a canonical
+/// 48 kHz stereo wav via `ffmpeg`, cached by source mtime + size (see the
+/// module docs). `ffmpeg` availability is detected ONCE at construction (a
+/// `PATH` scan, no spawn); tests inject a fake binary and a temp cache dir.
+#[derive(Debug, Clone)]
+pub struct Transcoder {
+    binary: Option<PathBuf>,
+    cache_dir: PathBuf,
+}
+
+impl Transcoder {
+    /// Detects `ffmpeg` on `PATH` and points the cache at
+    /// `~/.cache/soundboard/transcoded` (temp dir as the fallback when the
+    /// user cache dir cannot be determined).
+    #[must_use]
+    pub fn new() -> Self {
+        Transcoder {
+            binary: find_in_path(FFMPEG),
+            cache_dir: dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("soundboard")
+                .join("transcoded"),
+        }
+    }
+
+    /// A fallback-off transcoder (unit tests, explicit opt-out).
+    #[must_use]
+    pub fn disabled() -> Self {
+        Transcoder {
+            binary: None,
+            cache_dir: std::env::temp_dir(),
+        }
+    }
+
+    /// (tests) A transcoder around an injected ffmpeg binary and cache dir.
+    #[must_use]
+    pub fn with_binary_and_cache(binary: PathBuf, cache_dir: PathBuf) -> Self {
+        Transcoder {
+            binary: Some(binary),
+            cache_dir,
+        }
+    }
+
+    /// Transcodes `src` into the cached wav and returns its path. `None`
+    /// when the fallback is off (no ffmpeg detected/injected). A failed
+    /// transcode is `Err` — the caller then keeps the original decode
+    /// error, so the user still sees the honest per-clip failure.
+    pub fn transcode(&self, src: &Path) -> Option<Result<PathBuf>> {
+        let binary = self.binary.as_ref()?;
+        let Some(dst) = self.cache_path(src) else {
+            return Some(Err(anyhow::anyhow!(
+                "не удалось вычислить ключ кэша для {}",
+                src.display()
+            )));
+        };
+        // Cache hit: the source mtime + size are unchanged since the wav
+        // was made — reuse it instead of paying the transcode again.
+        if needs_transcode_for(Some(&dst)) {
+            if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
+                return Some(Err(e).with_context(|| {
+                    format!(
+                        "не удалось создать кэш-каталог {}",
+                        self.cache_dir.display()
+                    )
+                }));
+            }
+            let output = Command::new(binary)
+                .arg("-y")
+                .arg("-v")
+                .arg("error")
+                .arg("-i")
+                .arg(src)
+                .arg("-ar")
+                .arg("48000")
+                .arg("-ac")
+                .arg("2")
+                .arg(&dst)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    // Never leave a partial/failed file behind as a cache hit.
+                    let _ = std::fs::remove_file(&dst);
+                    return Some(Err(anyhow::anyhow!(
+                        "ffmpeg не смог перекодировать {}: {}",
+                        src.display(),
+                        last_stderr_line(&out.stderr)
+                    )));
+                }
+                Err(e) => {
+                    return Some(
+                        Err(e)
+                            .with_context(|| format!("не удалось запустить {}", binary.display())),
+                    );
+                }
+            }
+        }
+        Some(Ok(dst))
+    }
+
+    /// Cached wav path for `src`: `<cache_dir>/<stem>-<mtime+size hash>.wav`.
+    /// `None` when the source is unreadable or has no readable stem.
+    fn cache_path(&self, src: &Path) -> Option<PathBuf> {
+        cache_key(src).map(|key| self.cache_dir.join(format!("{key}.wav")))
+    }
+}
+
+impl Default for Transcoder {
+    fn default() -> Self {
+        Transcoder::new()
+    }
+}
+
+/// True when the cached wav must be (re)created: no cache path or no file.
+fn needs_transcode_for(dst: Option<&Path>) -> bool {
+    match dst {
+        Some(path) => !path.exists(),
+        None => true,
+    }
+}
+
+/// Cache key of a source clip: `<stem>-<fnv1a64(mtime nanos ++ size) in
+/// hex>`. Deterministic across runs; a re-recorded or edited clip gets a
+/// new key, an untouched one keeps reusing its cached wav.
+fn cache_key(src: &Path) -> Option<String> {
+    let stem = src.file_stem().and_then(OsStr::to_str)?;
+    let meta = std::fs::metadata(src).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a 64 offset basis
+    let mut bytes = [0_u8; 24];
+    bytes[..16].copy_from_slice(&mtime.as_nanos().to_le_bytes());
+    bytes[16..].copy_from_slice(&meta.len().to_le_bytes());
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(format!("{stem}-{hash:016x}"))
+}
+
+/// Resolves `name` against `PATH` (a plain scan, no spawn): first existing
+/// file wins. Executability is assumed — everything on `PATH` is.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Last non-empty stderr line (ffmpeg diagnostics land at the end).
+fn last_stderr_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("нет вывода")
+        .to_string()
 }
 
 /// Best-effort canonical form of `path`; falls back to the raw path when
@@ -1015,5 +1274,243 @@ mod tests {
         // (Linux pid_max caps far below this value by default.)
         let absent: u32 = 4_000_000_001;
         assert!(!cmdline_still_matches(absent, None));
+    }
+
+    /// A fake `pw-cat`: ANY invocation with an `.ogg` file argument dies
+    /// immediately with a decode error on stderr (the malformed-clip
+    /// signal); other files (the cached wav) play.
+    fn fake_player_failing_once(dir: &Path, log: &Path) -> PathBuf {
+        let script = dir.join("fake-pw-cat-once.sh");
+        write_script_atomic(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nfor last; do :; done\ncase \"$last\" in\n  *.ogg) echo 'sndfile: failed to open audio file: malformed' >&2\n        exit 42\n        ;;\nesac\nexec sleep 5\n",
+                log.display()
+            ),
+        );
+        script
+    }
+
+    /// A fake `ffmpeg`: writes a dummy wav payload to its LAST argument
+    /// (the `-o`-style destination our transcoder passes) and exits 0.
+    fn fake_ffmpeg(dir: &Path) -> PathBuf {
+        let script = dir.join("fake-ffmpeg.sh");
+        write_script_atomic(
+            &script,
+            "#!/bin/sh\nfor last; do :; done\nprintf 'RIFFfake' > \"$last\"\n",
+        );
+        script
+    }
+
+    #[test]
+    fn transcode_fallback_plays_the_cached_wav() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.log");
+        let clip = dir.path().join("доброе утро девочки.ogg");
+        File::create(&clip).expect("clip");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let transcoder = Transcoder::with_binary_and_cache(
+            fake_ffmpeg(dir.path()),
+            cache_dir.path().to_path_buf(),
+        );
+        let script = fake_player_failing_once(dir.path(), &log);
+        let mut player = PwCatPlayer::new()
+            .with_binary(script)
+            .with_probe_window(spawn_probe_window())
+            .with_transcoder(transcoder);
+
+        let handle = play_retrying(&mut player, &clip, "доброе", 1.0);
+        player.stop(handle).expect("stop");
+
+        // The cached wav exists under the deterministic mtime+size key and
+        // is exactly what the second pw-cat call was given.
+        let key = cache_key(&clip).expect("cache key");
+        let cached = cache_dir.path().join(format!("{key}.wav"));
+        assert_eq!(std::fs::read(&cached).expect("cached wav"), b"RIFFfake");
+        let calls = std::fs::read_to_string(&log).expect("read log");
+        let mut lines = calls.lines();
+        let first = lines.next().expect("first call");
+        assert!(first.contains(clip.to_str().expect("utf8 clip")), "{first}");
+        let second = lines.next().expect("second call");
+        assert!(
+            second.contains(cached.to_str().expect("utf8 dst")),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn cached_wav_is_reused_on_the_next_play() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.log");
+        let clip = dir.path().join("malformed.ogg");
+        File::create(&clip).expect("clip");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let transcoder = Transcoder::with_binary_and_cache(
+            fake_ffmpeg(dir.path()),
+            cache_dir.path().to_path_buf(),
+        );
+        let script = fake_player_failing_once(dir.path(), &log);
+        let mut player = PwCatPlayer::new()
+            .with_binary(script)
+            .with_probe_window(spawn_probe_window())
+            .with_transcoder(transcoder);
+
+        let h1 = play_retrying(&mut player, &clip, "x", 1.0);
+        player.stop(h1).expect("stop");
+        let h2 = play_retrying(&mut player, &clip, "x", 1.0);
+        player.stop(h2).expect("stop");
+
+        // 4 calls total: (ogg fails, cached wav plays) twice — the
+        // transcoder only had to run once because the cache key did not
+        // change between the plays.
+        let calls = std::fs::read_to_string(&log).expect("read log");
+        assert_eq!(calls.lines().count(), 4, "{calls}");
+    }
+
+    #[test]
+    fn transcode_failure_surfaces_the_original_decode_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.log");
+        let clip = dir.path().join("broken.ogg");
+        File::create(&clip).expect("clip");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        // ffmpeg exits non-zero without writing the destination.
+        let bad_ffmpeg = dir.path().join("bad-ffmpeg.sh");
+        write_script_atomic(
+            &bad_ffmpeg,
+            "#!/bin/sh\necho 'fake: transcode boom' >&2\nexit 3\n",
+        );
+        let transcoder =
+            Transcoder::with_binary_and_cache(bad_ffmpeg, cache_dir.path().to_path_buf());
+        let script = fake_player_failing_once(dir.path(), &log);
+        let mut player = PwCatPlayer::new()
+            .with_binary(script)
+            .with_probe_window(spawn_probe_window())
+            .with_transcoder(transcoder.clone());
+
+        let err = loop {
+            match player.play(&clip, "broken", 1.0) {
+                Ok(_) => panic!("expected the decode error to survive"),
+                Err(err) if is_etxtbsy(&err) => thread::sleep(Duration::from_millis(20)),
+                Err(err) => break err,
+            }
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("sndfile: failed to open audio file"),
+            "{text}"
+        );
+        // No partial file was cached.
+        assert_eq!(
+            playback_candidates(&clip, &transcoder).len(),
+            1,
+            "only the original path is a candidate"
+        );
+    }
+
+    #[test]
+    fn disabled_transcoder_keeps_the_decode_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("calls.log");
+        let clip = dir.path().join("broken.ogg");
+        File::create(&clip).expect("clip");
+        let script = fake_player_failing_once(dir.path(), &log);
+        let mut player = PwCatPlayer::new()
+            .with_binary(script)
+            .with_probe_window(spawn_probe_window())
+            .with_transcoder(Transcoder::disabled());
+        let err = loop {
+            match player.play(&clip, "broken", 1.0) {
+                Ok(_) => panic!("expected the decode error to survive"),
+                Err(err) if is_etxtbsy(&err) => thread::sleep(Duration::from_millis(20)),
+                Err(err) => break err,
+            }
+        };
+        assert!(err.to_string().contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_and_sensitive_to_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("clip.wav");
+        File::create(&a)
+            .expect("a")
+            .write_all(b"one")
+            .expect("write");
+        let same = cache_key(&a).expect("key");
+        assert_eq!(cache_key(&a).expect("key"), same, "same file, same key");
+
+        // A different size (re-recorded clip) must change the key.
+        let b = dir.path().join("clip2.wav");
+        File::create(&b)
+            .expect("b")
+            .write_all(b"two bytes!")
+            .expect("write");
+        assert_ne!(cache_key(&b).expect("key"), same);
+
+        // A changed mtime alone must change the key too.
+        File::create(&a)
+            .expect("a")
+            .write_all(b"one!")
+            .expect("write");
+        let changed = a
+            .metadata()
+            .expect("meta")
+            .modified()
+            .expect("mtime")
+            .checked_add(std::time::Duration::from_secs(3600))
+            .expect("mtime add");
+        let file = File::options().write(true).open(&a).expect("reopen");
+        file.set_times(std::fs::FileTimes::new().set_modified(changed))
+            .expect("set mtime");
+        drop(file);
+        assert_ne!(
+            cache_key(&a).expect("key"),
+            same,
+            "edited mtime must invalidate the cache entry"
+        );
+
+        // The key embeds the readable stem.
+        assert!(same.starts_with("clip-"), "{same}");
+    }
+
+    #[test]
+    fn needs_transcode_for_follows_cache_existence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dst = dir.path().join("cached.wav");
+        assert!(needs_transcode_for(Some(&dst)), "missing wav -> transcode");
+        File::create(&dst).expect("dst");
+        assert!(!needs_transcode_for(Some(&dst)), "existing wav -> reuse");
+        assert!(needs_transcode_for(None), "no path -> transcode");
+    }
+
+    #[test]
+    fn playback_candidates_include_the_cache_twin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let clip = dir.path().join("clip.ogg");
+        File::create(&clip).expect("clip");
+        let transcoder = Transcoder::with_binary_and_cache(
+            PathBuf::from("/nonexistent/ffmpeg"),
+            cache_dir.path().to_path_buf(),
+        );
+
+        // Without a cached wav only the original path is a candidate.
+        assert_eq!(playback_candidates(&clip, &transcoder), vec![clip.clone()]);
+
+        // Once the fallback has produced the wav, the twin is a candidate.
+        let key = cache_key(&clip).expect("key");
+        let cached = cache_dir.path().join(format!("{key}.wav"));
+        File::create(&cached).expect("cached");
+        assert_eq!(
+            playback_candidates(&clip, &transcoder),
+            vec![clip.clone(), cached]
+        );
+
+        // A disabled transcoder never adds candidates.
+        assert_eq!(
+            playback_candidates(&clip, &Transcoder::disabled()),
+            vec![clip]
+        );
     }
 }
